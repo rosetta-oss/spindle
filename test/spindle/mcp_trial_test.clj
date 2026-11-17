@@ -7,6 +7,7 @@
             [shuttle.client :as mc]
             [spindle.config :as config]
             [spindle.explain]
+            [spindle.mcp.trial :as trial]
             [spindle.server :as server]
             [spindle.stepcache :as stepcache]
             [spindle.tokens :as tokens]))
@@ -136,3 +137,12 @@
   (let [edn (pr-str {:steps [{:id :o :kind :sql :conn :shop :take [:other :x] :sql "select id from orders"}]})
         r (data (call "validate_flow" {:id "scratch/take-bad" :edn edn}))]
     (is (some #(re-find #"take" (str (:message %))) (:problems r)))))
+
+(deftest candidate-explains-only-the-changed-flow
+  ;; the live archive already holds shop/orders; a candidate adding shop/o2 must
+  ;; explain one step, not re-explain every flow (that made test_run take ~40 s)
+  (binding [spindle.explain/*archive-dir* (str (io/file (:root *env*) "explain"))]
+    (let [snap (config/current)
+          r (trial/build-candidate snap (trial/candidate-tree snap "shop/o2" (str/replace flow-edn "/shop/orders" "/shop/o2") flow-sql))]
+      (is (= {:explained 1 :archived 1}
+             (select-keys (get-in r [:snapshot :explain]) [:explained :archived]))))))

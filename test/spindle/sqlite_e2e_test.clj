@@ -106,3 +106,44 @@
         (is (:ok r))
         (is (:pinned @config/state))
         (is (= 404 (:status (call h :get "/shop/customer/2" {:key api-key}))))))))
+
+(deftest slow-sqlite-statement-is-interrupted
+  ;; SQLite runs in-process and its driver ignores setQueryTimeout: a statement past
+  ;; its timeout must still be interrupted and its pooled connection given back, or a
+  ;; few slow calls exhaust the pool. Own connection: pool of 2, no breaker.
+  (let [db (subs (:jdbc-url (:shop (read-string (slurp (str *dir* "/connections.edn"))))) (count "jdbc:sqlite:"))]
+    (write! *dir* "connections.edn"
+            (pr-str {:shop {:type :sql :dialect :sqlite :jdbc-url (str "jdbc:sqlite:" db)
+                            :pool {:max 2} :defaults {:timeout "2s" :max-rows 1000}}
+                     :slow {:type :sql :dialect :sqlite :jdbc-url (str "jdbc:sqlite:" db)
+                            :pool {:max 2} :defaults {:timeout "1s" :max-rows 1000}}})))
+  (write! *dir* "flows/shop/slow.edn"
+          (pr-str {:params '[:map [:n pos-int?]]
+                   :steps [{:id :slow :kind :sql :conn :slow :in {:n [:params :n]}}]
+                   :endpoint {:path "/shop/slow" :scopes #{"shop:read"}}}))
+  (write! *dir* "flows/shop/slow.sql"
+          "-- :name slow
+with recursive c(x) as (select 1 union all select x + 1 from c where x < :n) select count(*) as n from c")
+  (write! *dir* "flows/shop/fast.edn"
+          (pr-str {:steps [{:id :fast :kind :sql :conn :slow}]
+                   :endpoint {:path "/shop/fast" :scopes #{"shop:read"}}}))
+  (write! *dir* "flows/shop/fast.sql" "-- :name fast
+select count(*) as n from orders")
+  (let [r (config/reload! *dir*)] (is (:ok r) (pr-str r)))
+  (let [h (server/handler {:node-id "t" :config-dir *dir*})
+        slow #(let [t0 (System/nanoTime)
+                    r (call h :get "/shop/slow" {:qs "n=2000000000" :key api-key})]
+                [(:status r) (get-in r [:json :error :code]) (/ (- (System/nanoTime) t0) 1e9)])]
+    (testing "past its 1 s timeout the statement stops and the call fails as a timeout"
+      (let [[status code secs] (slow)]
+        (is (= 504 status))
+        (is (= "timeout" code))
+        (is (< secs 3.0) (str "took " secs " s"))))
+    (testing "more slow calls than the pool has connections: each still stops in time"
+      (dotimes [_ 3]
+        (let [[status code secs] (slow)]
+          (is (= 504 status) (str status " " code))
+          (is (< secs 3.0) (str "took " secs " s")))))
+    (testing "the pool still has free connections"
+      (let [r (call h :get "/shop/fast" {:key api-key})]
+        (is (= 200 (:status r)) (pr-str (:json r)))))))

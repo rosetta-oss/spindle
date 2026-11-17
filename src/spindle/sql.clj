@@ -12,7 +12,22 @@
   (:import [java.sql Connection PreparedStatement ResultSet ResultSetMetaData SQLException
             SQLTimeoutException SQLTransientConnectionException SQLRecoverableException
             Timestamp Date Time Array Clob]
+           [java.util.concurrent Executors ScheduledExecutorService ScheduledFuture ThreadFactory TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean]))
+
+;; One daemon thread fires statement timeouts. Statement.setQueryTimeout is a
+;; request that drivers may ignore (sqlite-jdbc does: a slow statement kept its
+;; pooled connection until it finished), so every statement also gets a timer
+;; that calls Statement.cancel() at its timeout.
+(defonce ^:private ^ScheduledExecutorService timeout-timer
+  (Executors/newSingleThreadScheduledExecutor
+   (reify ThreadFactory
+     (newThread [_ r] (doto (Thread. ^Runnable r "spindle-statement-timeout") (.setDaemon true))))))
+
+(defn- schedule-cancel!
+  "Run f after ms milliseconds; returns the ScheduledFuture to cancel when the statement ends."
+  ^ScheduledFuture [ms f]
+  (.schedule timeout-timer ^Runnable (fn [] (try (f) (catch Throwable _ nil))) (long ms) TimeUnit/MILLISECONDS))
 
 ;; ---------------------------------------------------------------------------
 ;; cancel registry (one per request)
@@ -141,7 +156,8 @@
         cancelled (AtomicBoolean. false)
         text (str "/* spindle " tag " */ " sql-text)]
     (let [^Connection con* (borrow-or-get rt ctx)
-          broken (volatile! false)]
+          broken (volatile! false)
+          timer (volatile! nil)]
       (try
         (when-let [iso (:isolation tuning)]
           ;; inside a transaction the isolation was set when it opened
@@ -149,12 +165,17 @@
         (with-open [^PreparedStatement ps (.prepareStatement con* text)]
           (doseq [[i v] (map-indexed vector args)]
             (bind! ps (inc i) v))
-          (.setQueryTimeout ps (int (min (remaining-s deadline-ns)
-                                         (long (Math/ceil (/ (conn/parse-duration-ms (:timeout tuning) 30000) 1000.0))))))
-          (cond limit (.setMaxRows ps (int limit))
-                max-rows (.setMaxRows ps (int (inc max-rows))))
-          (when-let [fs (:fetch-size tuning)] (.setFetchSize ps (int fs)))
-          (register-cancel! cancels cancel-key (fn [] (.set cancelled true) (try (.cancel ps) (catch Throwable _ nil))))
+          (let [step-ms (conn/parse-duration-ms (:timeout tuning) 30000)
+                timeout-s (min (remaining-s deadline-ns) (long (Math/ceil (/ step-ms 1000.0))))
+                left-ms (max 1 (quot (- deadline-ns (System/nanoTime)) 1000000))
+                cancel! (fn [] (.set cancelled true) (try (.cancel ps) (catch Throwable _ nil)))]
+            (.setQueryTimeout ps (int timeout-s))
+            (cond limit (.setMaxRows ps (int limit))
+                  max-rows (.setMaxRows ps (int (inc max-rows))))
+            (when-let [fs (:fetch-size tuning)] (.setFetchSize ps (int fs)))
+            (register-cancel! cancels cancel-key cancel!)
+            ;; enforce the timeout ourselves too (see timeout-timer)
+            (vreset! timer (schedule-cancel! (min step-ms left-ms) cancel!)))
           (try
             (execute-rows ps write? max-rows)
             (catch Throwable t
@@ -164,7 +185,9 @@
                 (vreset! broken (or (.get cancelled) (= code :timeout)))
                 (err/fail! code (if (= code :timeout) "statement cancelled or timed out" "statement failed")
                            {:step step-id :conn (:id rt)} t)))
-            (finally (deregister-cancel! cancels cancel-key))))
+            (finally
+              (when-let [^ScheduledFuture f @timer] (.cancel f false))
+              (deregister-cancel! cancels cancel-key))))
         (finally
           ;; a cancelled connection may be mid-protocol: never hand it to the next borrower
           (give-back! rt con* @broken ctx))))))

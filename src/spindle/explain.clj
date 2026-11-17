@@ -24,6 +24,14 @@
 
 (defn archive-dir [] (or *archive-dir* (System/getenv "SPINDLE_EXPLAIN_DIR") "explain-archive"))
 
+;; Further archives whose plans count as already explained (read only). Authoring
+;; tools build a candidate with a throwaway archive and add the live one here, so
+;; only the changed flow is explained, not every flow on every test_run/publish.
+(def ^:dynamic *known-dirs* [])
+
+(defn- archived? [flow-id version step-id]
+  (some #(.isFile (io/file % flow-id version (str (name step-id) ".json"))) (cons (archive-dir) *known-dirs*)))
+
 (defn example-values [step example]
   (into {}
         (for [{:keys [param list?]} (distinct (filter map? (:scanned step)))
@@ -43,7 +51,7 @@
               [step-id step] (:steps fl)
               :when (= :sql (:kind step))
               :let [f (io/file (archive-dir) flow-id (:version fl) (str (name step-id) ".json"))]]
-        (if (.isFile f)
+        (if (archived? flow-id (:version fl) step-id)
           (swap! out update :archived inc)
           (let [rt (get conns (:conn step))
                 [text & args] (sqlfile/render (:scanned step) (example-values step (first (:examples fl))))]

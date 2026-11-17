@@ -23,12 +23,17 @@
   (doseq [^java.io.File f (reverse (file-seq d))] (.delete f)))
 
 (defn build-candidate
-  "→ {:snapshot s} | {:problems [...]}. Never installs. Plans go to a temp archive
-   (deleted afterwards), so every SQL step is explained against the database."
+  "→ {:snapshot s} | {:problems [...]}. Never installs. New plans go to a temp archive
+   (deleted afterwards); a flow whose version already has plans in the live archive is
+   not explained again, so only the changed flow reaches the database."
   [snap tree]
   (let [dir (.toFile (Files/createTempDirectory "spindle-trial" (make-array FileAttribute 0)))]
     (try
-      (let [r (binding [explain/*archive-dir* (str dir)] (config/build tree snap))
+      (let [live-archive (explain/archive-dir)
+            r (binding [explain/*archive-dir* (str dir)
+                        ;; unchanged flows keep their version, so their live plans stand
+                        explain/*known-dirs* (conj explain/*known-dirs* live-archive)]
+                (config/build tree snap))
             live (set (mapcat (juxt :ds :client) (vals (:conns snap))))]
         (when-let [s (:snapshot r)]
           (doseq [rt (vals (:conns s)) :when (not (live (or (:ds rt) (:client rt))))]
