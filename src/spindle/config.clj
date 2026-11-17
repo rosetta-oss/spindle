@@ -27,6 +27,7 @@
             [spindle.env :as env]
             [spindle.explain :as explain]
             [spindle.flow :as flow]
+            [spindle.jwt]
             [spindle.metrics :as metrics]
             [spindle.sqlfile :as sqlfile])
   (:import [java.io File]
@@ -287,6 +288,7 @@
         auth-raw (some->> (get tree "auth.edn") (#(read-edn "auth.edn" % problems)))
         {auth-raw :value auth-missing :missing} (env/resolve-all auth-raw)
         _ (doseq [ref auth-missing] (swap! problems conj {:path ["auth.edn"] :message (str "unresolved ${" ref "}")}))
+        _ (swap! problems into (spindle.jwt/config-problems (:jwt auth-raw)))
         _ (when-not conns-raw (swap! problems conj {:path ["connections.edn"] :message "missing or empty"}))
         _ (doseq [p (env/literal-secrets conns-raw)]
             (swap! problems conj {:path (into ["connections.edn"] p) :message "literal secret: use ${ENV} or ${file:/path}"}))

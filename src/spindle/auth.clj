@@ -24,6 +24,7 @@
   (:require [clojure.string :as str]
             [jsonista.core :as json]
             [spindle.error :as err]
+            [spindle.jwt :as jwt]
             [spindle.tokens :as tokens])
   (:import [java.security MessageDigest]
            [java.util Base64]))
@@ -37,8 +38,9 @@
 (defn- constant-time= [^String a ^String b]
   (MessageDigest/isEqual (.getBytes (str a) "UTF-8") (.getBytes (str b) "UTF-8")))
 
-(defn compile-auth [{:keys [api-keys admin-scope]}]
+(defn compile-auth [{:keys [api-keys admin-scope] jwt-cfgs :jwt}]
   {:keys (mapv (fn [{:keys [id sha256 scopes]}] {:id id :sha256 (str/lower-case (str sha256)) :scopes (set scopes)}) api-keys)
+   :issuers (jwt/compile-issuers jwt-cfgs)
    :admin-scope (or admin-scope "spindle:admin")})
 
 (defn- presented-key [req]
@@ -70,6 +72,12 @@
   ([auth req] (authenticate auth nil req))
   ([auth store req]
    (when-let [k (presented-key req)]
+     (if (and (seq (:issuers auth)) (jwt/jwt-shaped? k))
+       (when-let [caller (jwt/verify (:issuers auth) k)]
+         ;; the token's subject is the end user; delegation headers still need spindle:delegate
+         (if (or (get-in req [:headers "x-spindle-user"]) (get-in req [:headers "x-spindle-user-claims"]))
+           (merge caller (end-user req caller))
+           caller))
      (let [h (sha256-hex k)
            entry (or (some #(when (constant-time= (:sha256 %) h) %) (:keys auth))
                      (when (and store (str/starts-with? k "spk_"))
@@ -77,7 +85,7 @@
                          {:id id :scopes (set scopes)})))]
        (when entry
          (let [caller {:client (:id entry) :id (:id entry) :scopes (:scopes entry)}]
-           (merge caller (end-user req caller))))))))
+           (merge caller (end-user req caller)))))))))
 
 (defn allowed? [caller required]
   (and caller (every? (:scopes caller) required)))

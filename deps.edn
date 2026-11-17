@@ -11,6 +11,8 @@
         info.sunng/ring-jetty9-adapter {:mvn/version "0.40.6"}
         org.babashka/sci {:mvn/version "0.15.59"}
         com.github.ben-manes.caffeine/caffeine {:mvn/version "3.1.8"}
+        ;; JWT verification against issuers' JWKS (Apache-2.0)
+        com.nimbusds/nimbus-jose-jwt {:mvn/version "10.10"}
         io.micrometer/micrometer-registry-prometheus {:mvn/version "1.13.6"}
         org.clojure/tools.logging {:mvn/version "1.3.0"}
         org.slf4j/slf4j-simple {:mvn/version "2.0.16"}
