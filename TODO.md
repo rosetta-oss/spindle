@@ -55,9 +55,12 @@ Where work continues after 2026-11-17. Everything up to `04110f7` was built and 
 - [x] **Long `IN` lists:** confirm chunks of 250 and the plans; try `:parallel` on chunked steps.
       2026-11-17: 600 keys → 3 chunks of 250, all 600 rows, 2.2 s; with `:parallel {:dev 2}` 1.7 s.
       Plans for chunked statements not yet inspected.
-- [ ] **NULL binding:** `setNull` fallback (JZ0SE) with `isnull(?, ...)` patterns.
-      2026-11-17: still fails through Spindle on ASE (`:after is null`, also with `convert(int, :after)`).
-      Workaround: parameter `:default`s, so no NULL is ever bound.
+- [x] **NULL binding:** `setNull` fallback (JZ0SE) with `isnull(?, ...)` patterns.
+      2026-11-17: cause found. ASE has no type-neutral NULL: `setNull(VARCHAR)` fails against an int column
+      ("Implicit conversion from VARCHAR to INT"), `Types/NULL`/`OTHER` are unsupported, parameter metadata
+      cannot resolve markers. Fixed: a missing `[:params k]` value is bound as NULL of the type its schema
+      implies (int → INTEGER, double → DOUBLE, boolean → BIT; strings and dates stay VARCHAR).
+      `[:page …]` and step-output inputs are still untyped. Integration test covers it.
 
 ## 3. First real graph (the first-release goal)
 

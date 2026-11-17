@@ -147,6 +147,37 @@
 
 (declare compile-flow*)
 
+(def ^:private schema-sql-types
+  {'int? java.sql.Types/INTEGER 'pos-int? java.sql.Types/INTEGER 'nat-int? java.sql.Types/INTEGER
+   'neg-int? java.sql.Types/INTEGER :int java.sql.Types/INTEGER
+   'double? java.sql.Types/DOUBLE :double java.sql.Types/DOUBLE 'number? java.sql.Types/DOUBLE
+   'boolean? java.sql.Types/BIT :boolean java.sql.Types/BIT})
+
+(defn- param-sql-types
+  "Top-level params → java.sql.Types for binding a missing value as NULL.
+   Strings, dates and anything else stay untyped (bound as VARCHAR on ASE)."
+  [params-schema]
+  (when (and params-schema (= :map (m/type params-schema)))
+    (into {} (for [[k _ sch] (m/children params-schema)
+                   :let [sch (if (= :maybe (m/type sch)) (first (m/children sch)) sch)
+                         t (schema-sql-types (m/form sch) (schema-sql-types (m/type sch)))]
+                   :when t]
+               [k t]))))
+
+(defn- null-types
+  "placeholder → java.sql.Types for a step's [:params k] inputs (nil when none)."
+  [in param-types]
+  (not-empty (into {} (for [[ph path] in
+                            :when (and (vector? path) (= 2 (count path)) (= :params (first path)))
+                            :let [t (get param-types (second path))] :when t]
+                        [ph t]))))
+
+(defn- type-nulls [values nts]
+  (if nts
+    ;; over the typed placeholders: a missing value may be absent from `values` entirely
+    (reduce-kv (fn [m k t] (if (nil? (get m k)) (assoc m k (sql/typed-null t)) m)) (or values {}) nts)
+    values))
+
 (defn compile-flow
   "→ {:flow compiled} or {:problems [...]}.
    `raw` is the flow EDN, `blocks` the .sql blocks, `conns` {id resolved-config}."
@@ -180,6 +211,7 @@
                       cache-s (stepcache/settings (:cache s))
                       base (merge {:skip-when-empty true :default []} s
                                   {:deps (step-deps s)
+                                   :null-types (when (#{:sql :proc} kind) (null-types in (param-sql-types params-schema)))
                                    :tuning (merge (:defaults ccfg) (:tuning s))
                                    :caller-dependent? caller?
                                    ;; a caller-dependent step is always cached per caller
@@ -471,6 +503,7 @@
   (let []
         (case (:kind step)
           :sql (let [{:keys [values empty]} (sql-values step env)
+                     values (type-nulls values (:null-types step))
                      ;; :take caps the rows returned (a number or a [:params ...] path)
                      take (let [t (:take step)] (if (vector? t) (paths/resolve-path t env) t))]
                  (if (and empty (:skip-when-empty step))
@@ -479,7 +512,8 @@
                            #(sql/run-step! rt step values (cond-> (assoc ctx :chunk-parallel (get-in env [:parallel (:conn step)] 1))
                                                             (pos-int? take) (assoc :take take))))))
           :proc (let [values (into {} (for [[k p] (:in step)]
-                                        [k (:value (paths/as-scalar (paths/resolve-path p env) k))]))]
+                                        [k (:value (paths/as-scalar (paths/resolve-path p env) k))]))
+                      values (type-nulls values (:null-types step))]
                   (cached step flow-id env [(:call step) (into (sorted-map) values)]
                           #(sql/run-proc! rt step values ctx)))
           :http (let [env (cond-> env (seq (get-in rt [:cfg :forward-caller])) (assoc :forward-caller (get-in rt [:cfg :forward-caller])))]

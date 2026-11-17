@@ -122,3 +122,14 @@
                 [:from {:optional true :default "1900-01-01"} :string]]]
     (is (= {:id 7 :from "1900-01-01"} (spindle.flow/coerce-params schema {:id "7"})))
     (is (= {:id 7 :from "2026-11-10"} (spindle.flow/coerce-params schema {:id "7" :from "2026-11-10"})))))
+
+(deftest null-types-from-params-schema
+  (let [schema (malli.core/schema [:map [:a pos-int?] [:b {:optional true} :int] [:c {:optional true} [:maybe int?]]
+                                   [:s {:optional true} :string] [:x {:optional true} :double]])
+        types (#'spindle.flow/param-sql-types schema)]
+    (is (= {:a java.sql.Types/INTEGER :b java.sql.Types/INTEGER :c java.sql.Types/INTEGER :x java.sql.Types/DOUBLE} types))
+    (is (= {:before java.sql.Types/INTEGER}
+           (#'spindle.flow/null-types {:before [:params :b] :name [:params :s] :k [:other :b]} types)))
+    (is (= {:before (spindle.sql/typed-null java.sql.Types/INTEGER) :name nil :n 3}
+           (#'spindle.flow/type-nulls {:before nil :name nil :n 3} {:before java.sql.Types/INTEGER})))))
+

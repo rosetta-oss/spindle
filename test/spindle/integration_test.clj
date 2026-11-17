@@ -186,6 +186,13 @@
                                  :steps [(merge {:id :s :kind :proc :conn :ase :read-only true} step)]
                                  :endpoint {:path (str "/it/" nm) :scopes #{"it"}}}
                           out (assoc :output out)))))
+      ;; an optional int param left out binds NULL as INTEGER (a VARCHAR NULL fails against an int column)
+      (write! dir "flows/it/nullint.edn"
+              (pr-str {:params [:map [:before {:optional true} 'pos-int?]]
+                       :steps [{:id :s :kind :sql :conn :ase :skip-when-empty false
+                                :sql "select top 2 id from master..sysobjects where (:before is null or id < :before) order by id desc"
+                                :in {:before [:params :before]}}]
+                       :endpoint {:path "/it/nullint" :scopes #{"it"}}}))
       (is (= nil (:problems (config/reload! (str dir)))))
       (let [h (server/handler {:node-id "it" :config-dir (str dir)})
             ds {:jdbcUrl (env "SPINDLE_IT_ASE_URL") :user (env "SPINDLE_IT_ASE_USER") :password (env "SPINDLE_IT_ASE_PASSWORD")}
@@ -215,5 +222,10 @@
         (testing ":proc — OUT parameter and return status"
           (is (= [{:msg "timeouts" :status 0}] (get-in (call h :get "/it/msg" "n=17000") [:json :rows])))
           (is (= 502 (:status (call h :get "/it/msg" "n=1999999999")))))
+        (testing "NULL for an omitted int parameter"
+          (let [r (call h :get "/it/nullint")]
+            (is (= 200 (:status r)) (pr-str (:json r)))
+            (is (= 2 (count (get-in r [:json :rows])))))
+          (is (= 200 (:status (call h :get "/it/nullint" "before=100")))))
         (testing "the pool still serves reads after a cancel"
           (is (= [{:one 1 :s "x"}] (get-in (call h :get "/it/read") [:json :rows]))))))))

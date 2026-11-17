@@ -86,17 +86,25 @@
     (when (<= ms 0) (err/fail! :timeout "deadline passed before statement"))
     (max 1 (long (Math/ceil (/ ms 1000.0))))))
 
+(defrecord TypedNull [^int sql-type])
+
+(defn typed-null
+  "A NULL bound with a java.sql.Types code (from the flow's parameter schema)."
+  [sql-type] (->TypedNull (int sql-type)))
+
 (defn- bind!
-  "Bind one parameter. Most drivers accept setObject(i, null); jConnect refuses it
-   (JZ0SE), so NULL then goes through setNull as VARCHAR. Not the driver's
-   parameter metadata: ASE guesses INT for e.g. isnull(?, '19000101'), which
-   then fails converting the fallback string."
+  "Bind one parameter. A TypedNull goes through setNull with its type. A plain nil:
+   most drivers accept setObject(i, null); jConnect refuses it (JZ0SE), so it then
+   goes through setNull as VARCHAR. ASE has no type-neutral NULL (Types/NULL and
+   OTHER are unsupported, parameter metadata cannot resolve markers): a VARCHAR
+   NULL compared with an int column fails, hence TypedNull."
   [^PreparedStatement ps ^long i v]
-  (if (nil? v)
-    (try (.setObject ps (int i) nil)
-         (catch java.sql.SQLException _
-           (.setNull ps (int i) java.sql.Types/VARCHAR)))
-    (.setObject ps (int i) v)))
+  (cond
+    (instance? TypedNull v) (.setNull ps (int i) (int (:sql-type v)))
+    (nil? v) (try (.setObject ps (int i) nil)
+                  (catch java.sql.SQLException _
+                    (.setNull ps (int i) java.sql.Types/VARCHAR)))
+    :else (.setObject ps (int i) v)))
 
 (defn- borrow-or-get
   "The request's transaction connection (mutation flows), or one from the pool."

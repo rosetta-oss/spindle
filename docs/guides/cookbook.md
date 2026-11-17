@@ -192,7 +192,11 @@ per caller, so one user's rows are never served to another.
  :endpoint {:path "/orders"}}
 ```
 
-- **`:default` in the params schema** fills in a missing optional parameter, so the SQL needs no NULL handling. Prefer this on ASE.
+- **`:default` in the params schema** fills in a missing optional parameter, so the SQL needs no NULL handling.
+- **Or a real NULL:** with `:skip-when-empty false`, a missing optional parameter is bound as NULL of the type its
+  schema implies (`pos-int?`/`:int` → INTEGER, `:double` → DOUBLE, `:boolean` → BIT, else VARCHAR), so
+  `(:before is null or order_no < :before)` works on ASE. Give the parameter a precise schema; ASE rejects a
+  VARCHAR NULL compared with an int column.
 - **`:take`** (a number or a `[:params …]` path) returns at most that many rows. The driver stops reading at N (`setMaxRows`; jConnect sends `set rowcount`). It is capped by the step's row cap and never fails with "row cap exceeded". ASE does not accept a parameter in `top`, so keep a fixed `top` as the ceiling.
 - **Paging:** pass the last row's `order_no` as `before` for the next page. Every page is an index range, so later pages stay fast and new rows cause no duplicates.
 
