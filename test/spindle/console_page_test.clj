@@ -34,3 +34,9 @@
   (testing "non-local without TLS is refused"
     (is (= 403 (:status (get* "/console" :remote "10.1.2.3"))))
     (is (= 403 (:status (get* "/console/console.js" :remote "10.1.2.3"))))))
+
+(deftest forwarded-https-and-bad-extension
+  (let [h (server/handler {:node-id "n1" :config-dir "none"})]
+    (is (= 200 (:status (h {:request-method :get :uri "/console" :remote-addr "10.1.2.3"
+                            :headers {"x-forwarded-proto" "https"}}))))
+    (is (= 404 (:status (get* "/console/x.edn"))))))

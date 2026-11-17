@@ -55,10 +55,15 @@
     var opts = { method: method, headers: { Authorization: 'Bearer ' + getToken() } };
     if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
     return fetch(path, opts).then(function (r) {
-      if (r.status === 401 || r.status === 403) { logout('Token rejected. Log in with an admin token.'); throw new Error('auth'); }
       return r.text().then(function (t) {
         var j = null; try { j = t ? JSON.parse(t) : null; } catch (e) { /* not json */ }
-        return { status: r.status, ok: r.ok, body: j };
+        var res = { status: r.status, ok: r.ok, body: j };
+        if (r.status === 401 || r.status === 403) {
+          var https = j && j.error && j.error.code === 'https_required';
+          logout(https ? errMsg(res) : 'Token rejected. Log in with an admin token.');
+          throw new Error('auth');
+        }
+        return res;
       });
     });
   }
@@ -92,22 +97,47 @@
     var s = state.status;
     if (!s) return;
     var cfg = s.config || {};
+    renderHeader(s);
+    if (!state.shell) buildControls();
+    renderData(s);
+  }
+  function renderHeader(s) {
+    var cfg = s.config || {};
     var title = $('title');
     title.textContent = '';
     title.appendChild(document.createTextNode('Spindle · ' + dash(s.node) + ' · config ' + dash(cfg.version) + ' '));
     if (cfg.pinned) title.appendChild(badge('pinned', 'pinned'));
+  }
+  function buildNav() {
     var nav = $('tabs');
     nav.textContent = '';
     TABS.forEach(function (t) {
-      nav.appendChild(el('button', { class: t === state.tab ? 'active' : '', text: t, onclick: function () { state.tab = t; refresh(); } }));
+      nav.appendChild(el('button', { class: t === state.tab ? 'active' : '', text: t, onclick: function () {
+        state.tab = t; state.shell = false; buildNav(); render(); refresh();
+      } }));
     });
+  }
+  // Controls (inputs, buttons with typed state) are built once per tab switch;
+  // only the data area is rebuilt on each poll.
+  function buildControls() {
     var view = $('view');
     view.textContent = '';
+    var c = el('div', { id: 'controls' });
+    var builder = { Caches: cacheControls, Tokens: tokenControls }[state.tab];
+    if (builder) builder(c);
+    view.appendChild(c);
+    view.appendChild(el('div', { id: 'data' }));
+    state.shell = true;
+  }
+  function renderData(s) {
+    var d = $('data');
+    d.textContent = '';
     var f = { Overview: overview, Connections: connections, Endpoints: endpoints, Caches: caches, Config: configTab, Tokens: tokensTab }[state.tab];
-    view.appendChild(f(s));
+    d.appendChild(f(s));
   }
 
-  function breakerBadge(b) { var v = dash(b).toLowerCase(); return badge(v.toUpperCase(), v); }
+  function breakerState(b) { return (b && b.state) || b; }
+  function breakerBadge(b) { var v = String(dash(breakerState(b))).toLowerCase(); return badge(v.toUpperCase(), v); }
   function bulk(b) { return b ? b.in_use + '/' + b.limit + ' (' + (b.queued || 0) + ' queued)' : '—'; }
   function poolText(p) {
     if (!p) return '—';
@@ -120,7 +150,7 @@
 
   function overview(s) {
     var cfg = s.config || {}, conns = s.connections || [];
-    var open = conns.filter(function (c) { return String(c.breaker).toLowerCase() === 'open'; }).length;
+    var open = conns.filter(function (c) { return String(breakerState(c.breaker)).toLowerCase() === 'open'; }).length;
     return table(['Item', 'Value'], [
       { cells: ['Node', s.node] },
       { cells: ['Config version', cfg.version] },
@@ -140,22 +170,20 @@
     return table(['Method', 'Path', 'Flow'],
       (s.endpoints || []).map(function (e) { return { cells: [String(dash(e.method)).toUpperCase(), e.path, e.id] }; }));
   }
+  function cacheRows(kind, obj) {
+    return Object.keys(obj || {}).map(function (k) {
+      var v = obj[k];
+      if (v && typeof v === 'object') return { cells: [kind, k, v.entries, v.hits, v.misses] };
+      return { cells: [kind, k, v, null, null] };
+    });
+  }
   function caches(s) {
-    var wrap = el('div');
-    var rows = [];
-    var stepCache = s.step_cache || {};
-    Object.keys(stepCache).forEach(function (k) {
-      var v = stepCache[k];
-      rows.push({ cells: ['step_cache', k, typeof v === 'object' ? JSON.stringify(v) : v] });
-    });
-    var cs = s.caches || {};
-    Object.keys(cs).forEach(function (k) {
-      var v = cs[k];
-      rows.push({ cells: ['cache', k, typeof v === 'object' ? JSON.stringify(v) : v] });
-    });
-    wrap.appendChild(table(['Kind', 'Name', 'Stats'], rows));
+    return table(['Kind', 'Name', 'Entries', 'Hits', 'Misses'],
+      cacheRows('step_cache', s.step_cache).concat(cacheRows('cache', s.caches)));
+  }
+  function cacheControls(c) {
     var tag = el('input', { id: 'evict-tag', placeholder: 'tag' });
-    wrap.appendChild(el('div', { class: 'inline' }, [tag, el('button', { class: 'danger', text: 'Evict tag', onclick: function () {
+    c.appendChild(el('div', { class: 'inline' }, [tag, el('button', { class: 'danger', text: 'Evict tag', onclick: function () {
       var t = tag.value.trim();
       if (!t) return;
       if (!confirm('Evict cache entries tagged "' + t + '"?')) return;
@@ -165,7 +193,6 @@
         refresh();
       }).catch(fail);
     } })]));
-    return wrap;
   }
   function configTab(s) {
     var cfg = s.config || {}, wrap = el('div');
@@ -203,11 +230,6 @@
   function scopeList(scopes) { return (scopes || []).join(', '); }
   function tokensTab(s) {
     var wrap = el('div'), t = state.tokens;
-    wrap.appendChild(el('div', { class: 'inline' }, [
-      el('button', { text: '+ Issue token', onclick: openIssue }),
-      el('label', {}, [el('input', Object.assign({ type: 'checkbox', id: 'show-revoked' }, state.showRevoked ? { checked: 'checked' } : {})), ' show revoked'])
-    ]));
-    wrap.querySelector('#show-revoked').addEventListener('change', function (e) { state.showRevoked = e.target.checked; render(); });
     if (!t) { wrap.appendChild(el('p', { class: 'muted', text: 'Loading…' })); return wrap; }
     if (t.disabled) { wrap.appendChild(el('p', { class: 'muted', text: 'Token store is not enabled on this node.' })); }
     var live = (t.tokens || []).filter(function (x) { return !x.revoked_at; });
@@ -225,8 +247,17 @@
       (t.config_keys || []).map(function (k) { return { cells: [k.id, scopeList(k.scopes)] }; }))));
     return wrap;
   }
+  function tokenControls(c) {
+    var cb = el('input', { type: 'checkbox', id: 'show-revoked' });
+    cb.checked = state.showRevoked;
+    cb.addEventListener('change', function (e) { state.showRevoked = e.target.checked; renderData(state.status); });
+    c.appendChild(el('div', { class: 'inline' }, [
+      el('button', { text: '+ Issue token', onclick: openIssue }),
+      el('label', {}, [cb, ' show revoked'])
+    ]));
+  }
   function revoke(id) {
-    if (!confirm('Revoke token "' + id + '"? It stops working immediately.')) return;
+    if (!confirm('Revoke token "' + id + '"? It stops working within 5 seconds.')) return;
     api('DELETE', '/admin/tokens/' + encodeURIComponent(id)).then(function (r) {
       $('banner').textContent = r.ok ? '' : 'Revoke failed: ' + errMsg(r);
       refresh();
@@ -253,12 +284,14 @@
     api('POST', '/admin/tokens', body).then(function (r) {
       if (!r.ok) { $('issue-error').textContent = r.status === 409 ? 'A token with that name already exists.' : errMsg(r); return; }
       $('issue-dialog').close();
+      $('secret-copy').textContent = 'Copy';
       $('secret-value').textContent = r.body.token;
       $('secret-dialog').showModal();
       refresh();
     }).catch(fail);
   }
-  function closeSecret() { $('secret-value').textContent = ''; $('secret-dialog').close(); }
+  function clearSecret() { $('secret-value').textContent = ''; $('secret-copy').textContent = 'Copy'; }
+  function closeSecret() { $('secret-dialog').close(); }
   function copySecret() {
     var v = $('secret-value').textContent;
     if (navigator.clipboard) navigator.clipboard.writeText(v).then(function () { $('secret-copy').textContent = 'Copied'; });
@@ -268,6 +301,8 @@
   function enter() {
     $('login').hidden = true;
     $('app').hidden = false;
+    state.shell = false;
+    buildNav();
     refresh();
     startPolling();
   }
@@ -288,6 +323,7 @@
   $('issue-cancel').addEventListener('click', function () { $('issue-dialog').close(); });
   $('secret-copy').addEventListener('click', copySecret);
   $('secret-close').addEventListener('click', closeSecret);
+  $('secret-dialog').addEventListener('close', clearSecret);
   document.addEventListener('visibilitychange', function () { if (!document.hidden && getToken()) refresh(); });
 
   if (getToken()) enter(); else logout('');

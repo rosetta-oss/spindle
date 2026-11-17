@@ -84,6 +84,8 @@
            [{:remote-addr "10.0.0.5" :scheme :http :headers {"x-forwarded-proto" "https"}} nil true]
            [{:remote-addr "10.0.0.5" :scheme :http :headers {"x-forwarded-proto" "https"}} "false" false]
            [{:remote-addr "10.0.0.5" :scheme :http :headers {"x-forwarded-proto" "http"}} nil false]
+           [{:remote-addr "[0:0:0:0:0:0:0:1]" :scheme :http} nil true]
+           [{:remote-addr "[::1]" :scheme :http} nil true]
            [{:remote-addr "10.0.0.5" :scheme :http} nil false]]]
     (testing (pr-str req env)
       (is (= ok? (binding [web/*env-trust-forwarded* (constantly env)] (web/secure? req)))))))
