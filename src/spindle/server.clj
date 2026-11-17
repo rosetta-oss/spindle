@@ -187,8 +187,9 @@
       (and (= uri "/admin/tokens") (= method :post)) (issue-token snap store req)
 
       (and (= method :delete) (str/starts-with? uri "/admin/tokens/"))
-      (let [id (subs uri (count "/admin/tokens/"))]
-        (if (and (not (str/blank? id)) (tokens/revoke! store id))
+      (let [id (try (java.net.URLDecoder/decode (subs uri (count "/admin/tokens/")) "UTF-8")
+                    (catch IllegalArgumentException _ nil))]
+        (if (and id (re-matches token-id-re id) (tokens/revoke! store id))
           (do (log/info (str "event=token-revoked id=" id " by=" (:id (auth/authenticate (:auth snap) store req))))
               (json-resp 200 {:revoked true}))
           (json-resp 404 {:error {:code "not_found" :message "no such live token"}})))
@@ -247,7 +248,7 @@
           (str/starts-with? uri "/admin/")
           (if-not (admin? snap store req)
             (json-resp 403 {:error {:code "forbidden" :message "admin scope required"}})
-            (case (if (str/starts-with? uri "/admin/tokens") :tokens [(:request-method req) uri])
+            (case (if (or (= uri "/admin/tokens") (str/starts-with? uri "/admin/tokens/")) :tokens [(:request-method req) uri])
               :tokens (if store (token-admin snap store req) (json-resp 404 {:error {:code "not_found"}}))
               [:post "/admin/reload"] (let [r (config/with-write-lock (config/reload! config-dir))] (register-gauges!) (json-resp (if (:ok r) 200 422) r))
               [:post "/admin/config/rollback"]

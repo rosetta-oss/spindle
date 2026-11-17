@@ -1,7 +1,8 @@
 (ns spindle.tokens
   "SQLite-backed store of authoring tokens. Only the SHA-256 of a token is
    persisted; the clear token is returned once by issue! and never logged."
-  (:require [jsonista.core :as json]
+  (:require [clojure.tools.logging :as log]
+            [jsonista.core :as json]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs])
   (:import [com.github.benmanes.caffeine.cache Caffeine Ticker]
@@ -48,8 +49,14 @@
   (let [p (->path path) d (->path dir)]
     (.startsWith p d)))
 
-(defn- conflict? [^SQLException e]
-  (boolean (re-find #"(?i)constraint|unique" (str (.getMessage e)))))
+(defn- conflict?
+  "SQLITE_CONSTRAINT (base result code 19, any extended code such as
+   PRIMARYKEY or UNIQUE)."
+  [^SQLException e]
+  (let [code (if (instance? org.sqlite.SQLiteException e)
+               (.code (.getResultCode ^org.sqlite.SQLiteException e))
+               (.getErrorCode e))]
+    (= 19 (bit-and (long code) 0xff))))
 
 (defn- fetch-live [ds h now]
   (when-let [row (jdbc/execute-one! ds ["select id, scopes, expires_at from tokens where sha256 = ? and revoked_at is null" h]
@@ -72,6 +79,7 @@
          _ (jdbc/execute! ds [ddl])
          ticker (reify Ticker (read [_] (* (long (now-ms)) 1000000)))
          cache (-> (Caffeine/newBuilder)
+                   (.maximumSize 10000)
                    (.expireAfterWrite cache-ms TimeUnit/MILLISECONDS)
                    (.ticker ticker)
                    (.build))
@@ -80,8 +88,11 @@
          touch! (fn [id now]
                   (let [prev (.get touched id)]
                     (when (or (nil? prev) (>= (- now (long prev)) touch-ms))
-                      (.put touched id now)
-                      (jdbc/execute! ds ["update tokens set last_used_at = ? where id = ?" (iso now) id]))))]
+                      (try
+                        (jdbc/execute! ds ["update tokens set last_used_at = ? where id = ?" (iso now) id])
+                        (.put touched id now)
+                        (catch Exception e
+                          (log/warn (str "event=token-touch-failed id=" id " error=" (.getName (class e)))))))))]
      (reify TokenStore
        (issue! [_ {:keys [id scopes expires-at created-by]}]
          (let [token (new-token)

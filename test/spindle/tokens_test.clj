@@ -85,3 +85,29 @@
       (is (every? #(contains? % :revoked_at) l))
       (is (every? #(contains? % :last_used_at) l))
       (is (some? (:revoked_at (second l)))))))
+
+(deftest failed-touch-does-not-break-lookup
+  (let [f (tmp-db)
+        s (tokens/open-sqlite f "cfg-elsewhere")
+        h (auth/sha256-hex (:token (tokens/issue! s {:id "a" :scopes #{"x"}})))
+        conn (java.sql.DriverManager/getConnection (str "jdbc:sqlite:" f))]
+    (try
+      (with-open [st (.createStatement conn)]
+        (.execute st "pragma busy_timeout = 0")
+        (.execute st "begin immediate"))
+      (is (= {:id "a" :scopes #{"x"}} (tokens/lookup s h)) "write lock held: touch fails, auth still works")
+      (finally (with-open [st (.createStatement conn)] (.execute st "rollback")) (.close conn)))
+    (is (nil? (:last_used_at (first (tokens/list-tokens s)))))
+    (tokens/lookup s h)
+    (is (some? (:last_used_at (first (tokens/list-tokens s)))) "failed touch was not remembered")))
+
+(deftest non-spk-keys-skip-the-store
+  (let [calls (atom 0)
+        store (reify tokens/TokenStore
+                (lookup [_ _] (swap! calls inc) nil)
+                (issue! [_ _]) (revoke! [_ _]) (list-tokens [_]))
+        req (fn [k] {:headers {"authorization" (str "Bearer " k)}})]
+    (is (nil? (auth/authenticate {:keys []} store (req "not-a-token"))))
+    (is (zero? @calls))
+    (is (nil? (auth/authenticate {:keys []} store (req "spk_unknown"))))
+    (is (= 1 @calls))))

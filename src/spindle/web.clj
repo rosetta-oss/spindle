@@ -14,7 +14,8 @@
   (boolean
    (when (string? addr)
      (let [a (str/replace addr #"^\[|\]$" "")]
-       (when (re-matches #"[0-9A-Fa-f:.]+" a)
+       (when (or (and (str/includes? a ":") (re-matches #"[0-9A-Fa-f:.]+" a))
+                 (re-matches #"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}" a))
          (try (.isLoopbackAddress (java.net.InetAddress/getByName a))
               (catch Exception _ false)))))))
 
@@ -26,7 +27,8 @@
   (boolean
    (or (loopback? (:remote-addr req))
        (= :https (:scheme req))
-       (and (= "https" (get-in req [:headers "x-forwarded-proto"]))
+       (and (= "https" (some-> (get-in req [:headers "x-forwarded-proto"])
+                               (str/split #",") first str/trim str/lower-case))
             (not= "false" (*env-trust-forwarded*))))))
 
 (defn insecure-resp []

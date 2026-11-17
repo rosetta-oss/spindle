@@ -72,7 +72,7 @@
    (when-let [k (presented-key req)]
      (let [h (sha256-hex k)
            entry (or (some #(when (constant-time= (:sha256 %) h) %) (:keys auth))
-                     (when store
+                     (when (and store (str/starts-with? k "spk_"))
                        (when-let [{:keys [id scopes]} (tokens/lookup store h)]
                          {:id id :scopes (set scopes)})))]
        (when entry

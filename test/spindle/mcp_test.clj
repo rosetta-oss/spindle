@@ -119,6 +119,12 @@
 (deftest flow-id-syntax
   (is (mcp/valid-flow-id? "shop/orders-2"))
   (is (not (mcp/valid-flow-id? "../x")))
+  (is (not (mcp/valid-flow-id? "a\\b")))
+  (is (not (mcp/valid-flow-id? "..\\x")))
   (is (not (mcp/valid-flow-id? "Shop")))
   (is (not (mcp/valid-flow-id? "a//b")))
   (is (not (mcp/valid-flow-id? (apply str (repeat 129 "a"))))))
+
+(deftest safe-defaults-is-an-allow-list
+  (is (= {:timeout "2s" :max-rows 1000}
+         (#'mcp/safe-defaults {:timeout "2s" :max-rows 1000 :dsn "postgres://u:p@h/db" :whatever 1}))))

@@ -62,7 +62,7 @@
                                                                                 :rows (if (sequential? rows) (count rows) (if (nil? rows) 0 1))
                                                                                 :ms ms}))})]
         {:output rows :steps @steps
-         :partial (mapv #(update (update % :step name) :code name) partial)}))))
+         :partial (mapv #(update (update % :step name) :code (fn [c] (some-> c name))) partial)}))))
 
 (defn explain [id edn sql params]
   (with-flow id edn sql

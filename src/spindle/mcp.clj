@@ -27,8 +27,12 @@
           (not (:ds rt)) [nil {:error "not a SQL connection"}]
           :else [rt nil])))
 
+(def ^:private default-keys
+  "Allow-list: the keys of config/Defaults (the only connection defaults Spindle uses)."
+  #{:timeout :isolation :fetch-size :max-rows :max-in})
+
 (defn- safe-defaults [d]
-  (into {} (remove (fn [[k _]] (re-find #"(?i)pass|secret|token|key|header|url|user|cred|auth" (name k)))) d))
+  (select-keys d default-keys))
 
 (defn- metadata [rt f]
   (try (conn/guarded rt f)
@@ -90,7 +94,10 @@
     (if-not (valid-flow-id? id)
       {:error "invalid flow id"}
       (try (f args)
-           (catch Throwable t {:error (or (ex-message t) "failed")})))))
+           (catch Throwable t
+             (when-not (instance? clojure.lang.ExceptionInfo t)
+               (log/warn (str "event=mcp-tool-failed flow=" id " error=" (.getName (class t)))))
+             {:error (or (ex-message t) "failed")})))))
 
 (def trial-tools
   [{:name "validate_flow"
@@ -140,9 +147,18 @@
                              (do (when-not (.startsWith p flows) (throw (ex-info "invalid flow id" {})))
                                  [p (some-> ^String text (.getBytes "UTF-8"))])))
                 before (mapv (fn [[p _]] [p (read-bytes p)]) files)
-                restore! #(doseq [[p b] before] (write-atomic! p b))]
+                restore! (fn []
+                           (let [errs (reduce (fn [errs [p b]]
+                                                (try (write-atomic! p b) errs
+                                                     (catch Throwable t (conj errs t))))
+                                              [] before)]
+                             (when (seq errs)
+                               (log/warn (str "event=publish-restore-failed flow=" id " failures=" (count errs))))
+                             errs))]
             (try (doseq [[p b] files] (write-atomic! p b))
-                 (catch Throwable t (restore!) (throw t)))
+                 (catch Throwable t
+                   (doseq [e (restore!)] (.addSuppressed t e))
+                   (throw t)))
             (let [r (try (config/reload! config-dir)
                          (catch Throwable t {:problems [{:message (or (ex-message t) "reload failed")}]}))]
               (if (:ok r)
@@ -159,7 +175,10 @@
               (if-not (valid-flow-id? id)
                 {:error "invalid flow id"}
                 (try (publish! config-dir ctx id edn sql)
-                     (catch Throwable t {:error (or (ex-message t) "failed")}))))})
+                     (catch Throwable t
+                       (when-not (instance? clojure.lang.ExceptionInfo t)
+                         (log/warn (str "event=publish-failed flow=" id " error=" (.getName (class t)))))
+                       {:error (or (ex-message t) "failed")}))))})
 
 (def default-tools (into read-tools trial-tools))
 

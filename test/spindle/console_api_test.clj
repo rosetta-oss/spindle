@@ -7,7 +7,8 @@
             [spindle.config :as config]
             [spindle.explain]
             [spindle.server :as server]
-            [spindle.tokens :as tokens]))
+            [spindle.tokens :as tokens]
+            [spindle.web :as web]))
 
 (def ^:dynamic *dir* nil)
 
@@ -126,3 +127,21 @@
     (is (= 403 (:status (call h :post "/admin/tokens" nil :remote "10.0.0.5" :body {:id "zz" :scopes ["x"]})))
         "https check precedes auth")
     (is (= 200 (:status (call h :get "/admin/tokens" admin :remote "10.0.0.5" :headers {"x-forwarded-proto" "https"}))))))
+
+(deftest issue-rejects-garbage-expiry
+  (let [{:keys [h admin]} (setup)]
+    (is (= 400 (:status (call h :post "/admin/tokens" admin :body {:id "exp-2" :scopes ["x"] :expires_at "garbage"}))))))
+
+(deftest revoke-route-is-strict
+  (let [{:keys [h admin]} (setup)]
+    (is (= 201 (:status (call h :post "/admin/tokens" admin :body {:id "rv-1" :scopes ["x"]}))))
+    (is (= 404 (:status (call h :delete "/admin/tokensX" admin))))
+    (is (= 404 (:status (call h :delete "/admin/tokens/Bad%20Id" admin))))
+    (is (= 200 (:status (call h :delete "/admin/tokens/rv%2D1" admin))))))
+
+(deftest forwarded-proto-normalised
+  (is (web/secure? {:remote-addr "10.0.0.5" :headers {"x-forwarded-proto" "HTTPS, http"}}))
+  (is (not (web/secure? {:remote-addr "10.0.0.5" :headers {"x-forwarded-proto" "http, https"}})))
+  (is (not (web/secure? {:remote-addr "localhost"})))
+  (is (web/secure? {:remote-addr "127.0.0.1"}))
+  (is (web/secure? {:remote-addr "[::1]"})))

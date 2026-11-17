@@ -228,8 +228,8 @@ SPINDLE_CONFIG_DIR=config bin/spindle                   # adds drivers/*.jar
   Publish is refused (`node is pinned`) after a rollback; `POST /admin/config/unpin` first. Every publish is
   logged as `event=flow-published flow=<id> by=<token id> version=<v>`.
 - **HTTPS:** `/console`, `/mcp` and `/admin/tokens*` refuse plain HTTP (403) unless the request comes from
-  loopback or carries `X-Forwarded-Proto: https`. Set `SPINDLE_TRUST_FORWARDED_PROTO=false` when Spindle is
-  reachable without the proxy, so clients cannot set that header themselves. Note that loopback is trusted:
+  loopback or carries `X-Forwarded-Proto: https`. The header is **trusted by default**; deployments reachable
+  without the proxy must set `SPINDLE_TRUST_FORWARDED_PROTO=false`, so clients cannot set that header themselves. Note that loopback is trusted:
   a reverse proxy on the same host that forwards **plain HTTP** from loopback passes the guard too, so make sure
   such a proxy only accepts HTTPS from the outside.
 
