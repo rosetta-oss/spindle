@@ -150,7 +150,30 @@ per caller, so one user's rows are never served to another.
 - **Row caps and timeouts:** keep them tight. A cancelled statement releases its locks, and Spindle evicts the
   connection if the cancel leaves it in an unknown state.
 
-## 8. Raw search results merged with SQL and API (*roadmap*: `:search`)
+## 8. Optional filters and page size (ASE)
+
+**When to use it:** a list endpoint with optional filters, a caller-chosen page size and "next page" paging.
+
+```clojure
+{:params [:map
+          [:to_acct_no pos-int?]
+          [:limit  {:optional true :default 50} [:int {:min 1 :max 500}]]
+          [:before {:optional true :default 2147483647} pos-int?]
+          [:from   {:optional true :default "1900-01-01"} [:re "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"]]]
+ :steps [{:id :orders :kind :sql :conn :ase :take [:params :limit]
+          :sql "select top 500 order_no, entry_datetime from order_header
+                where to_acct_no = :to_acct_no and order_no < :before
+                  and entry_datetime >= convert(datetime, :from)
+                order by order_no desc"
+          :in {:to_acct_no [:params :to_acct_no] :before [:params :before] :from [:params :from]}}]
+ :endpoint {:path "/orders"}}
+```
+
+- **`:default` in the params schema** fills in a missing optional parameter, so the SQL needs no NULL handling. Prefer this on ASE.
+- **`:take`** (a number or a `[:params …]` path) returns at most that many rows. The driver stops reading at N (`setMaxRows`; jConnect sends `set rowcount`). It is capped by the step's row cap and never fails with "row cap exceeded". ASE does not accept a parameter in `top`, so keep a fixed `top` as the ceiling.
+- **Paging:** pass the last row's `order_no` as `before` for the next page. Every page is an index range, so later pages stay fast and new rows cause no duplicates.
+
+## 9. Raw search results merged with SQL and API (*roadmap*: `:search`)
 
 ```clojure
 {:steps [{:id :hits :kind :search :conn :es

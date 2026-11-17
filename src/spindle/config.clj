@@ -114,6 +114,7 @@
               [:skip-when-empty {:optional true} boolean?]
               [:empty-on-404 {:optional true} boolean?]
               [:max-rows {:optional true} pos-int?]
+              [:take {:optional true} [:or pos-int? [:vector any?]]]
               [:tuning {:optional true} Defaults]]]]
    [:output {:optional true} map?]
    [:parallel {:optional true} [:map-of keyword? pos-int?]]

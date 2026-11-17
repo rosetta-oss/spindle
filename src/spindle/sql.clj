@@ -98,7 +98,7 @@
     (.setObject ps (int i) v)))
 
 (defn- run-one!
-  [rt ^String sql-text args {:keys [tuning deadline-ns cancels step-id tag max-rows]}]
+  [rt ^String sql-text args {:keys [tuning deadline-ns cancels step-id tag max-rows limit]}]
   (let [{:keys [ds] d :dialect} rt
         cancel-key (Object.)
         cancelled (AtomicBoolean. false)
@@ -116,7 +116,8 @@
             (bind! ps (inc i) v))
           (.setQueryTimeout ps (int (min (remaining-s deadline-ns)
                                          (long (Math/ceil (/ (conn/parse-duration-ms (:timeout tuning) 30000) 1000.0))))))
-          (when max-rows (.setMaxRows ps (int (inc max-rows))))
+          (cond limit (.setMaxRows ps (int limit))
+                max-rows (.setMaxRows ps (int (inc max-rows))))
           (when-let [fs (:fetch-size tuning)] (.setFetchSize ps (int fs)))
           (register-cancel! cancels cancel-key (fn [] (.set cancelled true) (try (.cancel ps) (catch Throwable _ nil))))
           (try
@@ -140,12 +141,18 @@
    this request's share of the connection."
   [rt {:keys [scanned id tuning max-rows] :as _step} values ctx]
   (let [max-in (or (:max-in tuning) (:max-in (:dialect rt)))
-        renders (sqlfile/chunked-renders scanned values max-in)]
+        renders (sqlfile/chunked-renders scanned values max-in)
+        ;; :take (≤ the row cap) returns at most that many rows instead of failing:
+        ;; the driver stops at N (setMaxRows; jConnect sends `set rowcount`)
+        take (when-let [t (:take ctx)] (if max-rows (min t max-rows) t))]
     (loop [rs renders acc []]
       (if-let [[text & args] (first rs)]
-        (let [rows (conn/guarded rt #(run-one! rt text args (assoc ctx :tuning tuning :step-id id
-                                                                   :max-rows (when max-rows (- max-rows (count acc))))))]
-          (recur (rest rs) (into acc rows)))
+        (let [left (if take (- take (count acc)) (when max-rows (- max-rows (count acc))))
+              rows (conn/guarded rt #(run-one! rt text args (-> ctx (dissoc :take)
+                                                                (assoc :tuning tuning :step-id id)
+                                                                (merge (if take {:max-rows nil :limit left} {:max-rows left})))))
+              acc (into acc rows)]
+          (if (and take (>= (count acc) take)) (subvec acc 0 take) (recur (rest rs) acc)))
         acc))))
 
 (defn- warnings-text [^java.sql.SQLWarning w]

@@ -129,6 +129,9 @@
                   (when-not ccfg (add! [:steps id :conn] (str "unknown connection " conn)))
                   (doseq [dep (:deps base) :when (not (ids dep))]
                     (add! [:steps id] (str "refers to unknown step " dep)))
+                  (when-let [t (:take s)]
+                    (when-not (or (pos-int? t) (and (vector? t) (= :params (first t))))
+                      (add! [:steps id :take] "take must be a positive integer or a [:params ...] path")))
                   (when (and (:or-else s) (not (ids (:or-else s))))
                     (add! [:steps id :or-else] (str "unknown fallback step " (:or-else s))))
                   [id
@@ -250,11 +253,13 @@
       (if (and (:when step) (not (eval-cond (:when step) env)))
         (:default step)                       ; skipped: a stable, declared value
         (case (:kind step)
-          :sql (let [{:keys [values empty]} (sql-values step env)]
+          :sql (let [{:keys [values empty]} (sql-values step env)
+                     ;; :take caps the rows returned (a number or a [:params ...] path)
+                     take (let [t (:take step)] (if (vector? t) (paths/resolve-path t env) t))]
                  (if (and empty (:skip-when-empty step))
                    []
-                   (cached step flow-id env [(:sql-text step) (into (sorted-map) values)]
-                           #(sql/run-step! rt step values ctx))))
+                   (cached step flow-id env [(:sql-text step) (into (sorted-map) values) take]
+                           #(sql/run-step! rt step values (cond-> ctx (pos-int? take) (assoc :take take))))))
           :http (let [env (cond-> env (seq (get-in rt [:cfg :forward-caller])) (assoc :forward-caller (get-in rt [:cfg :forward-caller])))]
                   (httpstep/extract
                    step

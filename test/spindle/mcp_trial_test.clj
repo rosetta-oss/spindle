@@ -120,3 +120,18 @@
                               :sql "select coalesce(:x, 'none') as v" :in {:x [:params :x]}}]})]
     (is (= [{:v "none"}] (:output (data (call "test_run" {:id "scratch/opt" :edn edn :params {}})))))
     (is (= [{:v "given"}] (:output (data (call "test_run" {:id "scratch/opt" :edn edn :params {:x "given"}})))))))
+
+(deftest take-caps-rows-from-a-param
+  (let [edn (pr-str {:params [:map [:limit {:optional true :default 2} [:int {:min 1 :max 100}]]]
+                     :steps [{:id :o :kind :sql :conn :shop :take [:params :limit]
+                              :sql "select id from orders order by id"}]})]
+    (is (= 2 (count (:output (data (call "test_run" {:id "scratch/take" :edn edn :params {}}))))) "default limit")
+    (is (= 1 (count (:output (data (call "test_run" {:id "scratch/take" :edn edn :params {:limit 1}}))))))
+    (is (= [{:id 1}] (:output (data (call "test_run" {:id "scratch/take" :edn edn :params {:limit 1}})))) "first rows kept")
+    (is (<= 2 (count (:output (data (call "test_run" {:id "scratch/take" :edn edn :params {:limit 100}})))))
+        "a take above the row count returns everything, no row-cap error")))
+
+(deftest take-must-be-a-number-or-params-path
+  (let [edn (pr-str {:steps [{:id :o :kind :sql :conn :shop :take [:other :x] :sql "select id from orders"}]})
+        r (data (call "validate_flow" {:id "scratch/take-bad" :edn edn}))]
+    (is (some #(re-find #"take" (str (:message %))) (:problems r)))))
