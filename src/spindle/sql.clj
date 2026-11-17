@@ -7,6 +7,7 @@
             [spindle.conn :as conn]
             [spindle.dialect :as dialect]
             [spindle.error :as err]
+            [spindle.par :as par]
             [spindle.sqlfile :as sqlfile])
   (:import [java.sql Connection PreparedStatement ResultSet ResultSetMetaData SQLException
             SQLTimeoutException SQLTransientConnectionException SQLRecoverableException
@@ -160,14 +161,27 @@
 
 (defn run-step!
   "Execute a compiled :sql step with resolved `values` (placeholder → value).
-   IN lists are chunked to the dialect's limit; chunks run one after another on
-   this request's share of the connection."
+   IN lists are chunked to the dialect's limit. Chunks run one after another,
+   or in parallel when the flow's :parallel allows this connection more than
+   one statement at once (never inside a transaction, never with :take)."
   [rt {:keys [scanned id tuning max-rows write?] :as _step} values ctx]
   (let [max-in (or (:max-in tuning) (:max-in (:dialect rt)))
         renders (sqlfile/chunked-renders scanned values max-in)
         ;; :take (≤ the row cap) returns at most that many rows instead of failing:
         ;; the driver stops at N (setMaxRows; jConnect sends `set rowcount`)
-        take (when-let [t (:take ctx)] (if max-rows (min t max-rows) t))]
+        take (when-let [t (:take ctx)] (if max-rows (min t max-rows) t))
+        n (or (:chunk-parallel ctx) 1)
+        run (fn [[text & args] limits]
+              (conn/guarded rt #(run-one! rt text args (-> ctx (dissoc :take :chunk-parallel)
+                                                           (assoc :tuning tuning :step-id id :write? write?)
+                                                           (merge limits)))))]
+    (if (and (> n 1) (> (count renders) 1) (not take) (not (:con ctx)))
+      ;; chunks in parallel (the flow allows this connection n steps at once);
+      ;; each chunk gets the whole cap, the total is checked afterwards
+      (let [acc (into [] cat (par/bounded-map n #(run % {:max-rows max-rows}) renders))]
+        (when (and max-rows (> (count acc) max-rows))
+          (err/fail! :too_many_rows "row cap exceeded" {:max-rows max-rows}))
+        acc)
     (loop [rs renders acc []]
       (if-let [[text & args] (first rs)]
         (let [left (if take (- take (count acc)) (when max-rows (- max-rows (count acc))))
@@ -176,7 +190,7 @@
                                                                 (merge (if take {:max-rows nil :limit left} {:max-rows left})))))
               acc (into acc rows)]
           (if (and take (>= (count acc) take)) (subvec acc 0 take) (recur (rest rs) acc)))
-        acc))))
+        acc)))))
 
 (defn- warnings-text [^java.sql.SQLWarning w]
   (loop [w w acc []]

@@ -12,6 +12,7 @@
             [jsonista.core :as json]
             [spindle.conn :as conn]
             [spindle.error :as err]
+            [spindle.par :as par]
             [spindle.paths :as paths]
             [spindle.sql :as sql])
   (:import [java.net URLEncoder]
@@ -118,7 +119,11 @@
   [rt step env ctx]
   (if-let [fan-path (:fan-out step)]
     (let [vs (paths/as-list (paths/resolve-path fan-path env))]
-      (mapv (fn [v] (conn/guarded rt #(call-once! rt step (assoc env :fan v) ctx))) vs))
+      ;; one call per value, up to :concurrency at once (default 4); the
+      ;; connection's bulkhead still bounds calls across all requests
+      (par/bounded-map (or (:concurrency step) 4)
+                       (fn [v] (conn/guarded rt #(call-once! rt step (assoc env :fan v) ctx)))
+                       vs))
     [(conn/guarded rt #(call-once! rt step env ctx))]))
 
 (defn extract

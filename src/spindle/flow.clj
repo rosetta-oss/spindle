@@ -237,6 +237,8 @@
                          (when-let [rp (:rows s)]
                            (when-not (re-matches #"\$(\.[A-Za-z_][A-Za-z0-9_-]*|\[\*\])*" rp)
                              (add! [:steps id :rows] (str "unsupported JSON path " rp "; use $, $.a.b, $[*], $.a[*].b"))))
+                         (when (and (:concurrency s) (not (:fan-out s)))
+                           (add! [:steps id :concurrency] ":concurrency is for :fan-out steps"))
                          (let [w? (contains? #{:put :patch :delete} (get-in s [:request :method]))]
                            (when (and w? (not mutation?))
                              (add! [:steps id :request :method] "PUT/PATCH/DELETE are writes: they need a mutation endpoint"))
@@ -474,7 +476,8 @@
                  (if (and empty (:skip-when-empty step))
                    (:default step)
                    (cached step flow-id env [(:sql-text step) (into (sorted-map) values) take]
-                           #(sql/run-step! rt step values (cond-> ctx (pos-int? take) (assoc :take take))))))
+                           #(sql/run-step! rt step values (cond-> (assoc ctx :chunk-parallel (get-in env [:parallel (:conn step)] 1))
+                                                            (pos-int? take) (assoc :take take))))))
           :proc (let [values (into {} (for [[k p] (:in step)]
                                         [k (:value (paths/as-scalar (paths/resolve-path p env) k))]))]
                   (cached step flow-id env [(:call step) (into (sorted-map) values)]

@@ -131,6 +131,7 @@
    [:request {:optional true} Request]
    [:rows {:optional true} string?]
    [:fan-out {:optional true} Path]
+   [:concurrency {:optional true} pos-int?]
    [:or-else {:optional true} keyword?]
    [:after {:optional true} [:vector keyword?]]
    [:when {:optional true} [:or map? vector?]]

@@ -242,3 +242,25 @@
         (is (= :rolled_back (:outcome r)))
         (is (= {:id 1 :comment "trial"} (:rows r)) "the trial sees its own write")
         (is (= "changed elsewhere" (:orders/comment (q1 "select comment from spindle_it.orders where id = 1"))))))))
+
+;; ---------------------------------------------------------------------------
+;; IN-list chunks in parallel
+;; ---------------------------------------------------------------------------
+
+(deftest in-chunks-in-parallel
+  (when (enabled?)
+    (doseq [[f par] [["seq" nil] ["par" {:pg 3}]]]
+      (write! (str "flows/it/chunks-" f ".edn")
+              (pr-str (cond-> {:params '[:map [:ids [:vector pos-int?]]]
+                               :steps [{:id :x :kind :sql :conn :pg :in {:ids [:params :ids]} :tuning {:max-in 2}
+                                        :sql "select g as id from (select pg_sleep(0.3)) s, generate_series(1, 10) g where g in :ids"}]
+                               :endpoint {:path (str "/it/chunks-" f)}}
+                        par (assoc :parallel par)))))
+    (let [r (reload)] (is (:ok r) (pr-str r)))
+    (let [t (fn [uri] (let [t0 (System/currentTimeMillis) r (call :get uri)]
+                        [(- (System/currentTimeMillis) t0) (sort (map :id (get-in r [:json :rows])))]))
+          [ms-seq rows-seq] (t "/it/chunks-seq?ids=1,2,3,4,5,6")
+          [ms-par rows-par] (t "/it/chunks-par?ids=1,2,3,4,5,6")]
+      (is (= [1 2 3 4 5 6] rows-seq rows-par))
+      (is (>= ms-seq 850) (str "3 chunks one after another: " ms-seq " ms"))
+      (is (< ms-par 650) (str "3 chunks at once: " ms-par " ms")))))
