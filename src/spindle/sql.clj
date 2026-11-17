@@ -159,15 +159,23 @@
 
         (= :showplan ex)
         ;; Sybase ASE: showplan text arrives as warnings; noexec compiles without running
-        (with-open [st (.createStatement con)]
-          (.execute st "set showplan on")
-          (.execute st "set noexec on")
-          (let [text (with-open [^PreparedStatement ps (.prepareStatement con sql-text)]
+        ;; jConnect may also *throw* showplan output as SybSQLWarning (from execute and
+        ;; even from Statement.close): that is plan text, not a failure.
+        (let [thrown (StringBuilder.)
+              quiet (fn [f] (try (f) (catch java.sql.SQLWarning w
+                                       (.append thrown "\n") (.append thrown (warnings-text w)) nil)))
+              st (.createStatement con)]
+          (quiet #(.execute st "set showplan on"))
+          (quiet #(.execute st "set noexec on"))
+          (quiet #(.close st))
+          (let [^PreparedStatement ps (.prepareStatement con sql-text)
+                text (try
                        (.setQueryTimeout ps 10)
                        (doseq [[i v] (map-indexed vector args)] (.setObject ps (int (inc i)) v))
-                       (try (.execute ps) (catch SQLException _ nil))
-                       (str (warnings-text (.getWarnings ps)) "\n" (warnings-text (.getWarnings con))))]
-            [{:plan (str/trim text)}]))
+                       (try (quiet #(.execute ps)) (catch SQLException _ nil))
+                       (str (warnings-text (.getWarnings ps)) "\n" (warnings-text (.getWarnings con)))
+                       (finally (quiet #(.close ps))))]
+            [{:plan (str/trim (str text thrown))}]))
 
         :else [{:plan "explain not supported for this dialect"}])
       (finally

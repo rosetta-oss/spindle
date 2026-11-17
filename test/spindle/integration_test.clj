@@ -6,6 +6,7 @@
      AW_DB_HOST AW_DB_PORT AW_DB_USER AW_DB_PASSWORD [ERP_API_URL ERP_API_TOKEN]
    MySQL:      SPINDLE_IT_MYSQL_URL SPINDLE_IT_MYSQL_USER SPINDLE_IT_MYSQL_PASSWORD
    ClickHouse: SPINDLE_IT_CH_URL SPINDLE_IT_CH_USER SPINDLE_IT_CH_PASSWORD
+   Sybase ASE: SPINDLE_IT_ASE_URL SPINDLE_IT_ASE_USER SPINDLE_IT_ASE_PASSWORD (+ drivers/jconn4.jar, alias :ase)
 
    For every dialect: a read works, a statement past its deadline returns 504,
    and the statement is really gone from the server afterwards (cancelled)."
@@ -147,3 +148,44 @@
           (is (wait-until #(zero? (long (:n (jdbc/execute-one! ds ["select count() as n from system.processes where query like '%sleepEachRow(0.25)%' and query not like '%system.processes%'"]))))
                           3000)
               "query no longer in system.processes"))))))
+
+;; ---------------------------------------------------------------------------
+;; Sybase ASE (jConnect)
+;;   SPINDLE_IT_ASE_URL SPINDLE_IT_ASE_USER SPINDLE_IT_ASE_PASSWORD
+;;   needs drivers/jconn4.jar and the :ase alias: clojure -M:test:ase
+;; ---------------------------------------------------------------------------
+
+(def ^:private ase-slow
+  ;; flows run read statements only, so no `waitfor delay`: a 4-way cross join instead
+  "select count(*) as n from master..sysobjects a, master..sysobjects b, master..sysobjects c, master..sysobjects d")
+
+(deftest sybase-ase-read-timeout-cancel
+  (when (env "SPINDLE_IT_ASE_URL")
+    (let [dir (tmpdir)]
+      (write! dir "connections.edn"
+              (pr-str {:ase {:type :sql :dialect :sybase-ase :jdbc-url (env "SPINDLE_IT_ASE_URL")
+                             :username "${SPINDLE_IT_ASE_USER}" :password "${SPINDLE_IT_ASE_PASSWORD}"
+                             ;; a remote ASE login can take more than the 2 s default
+                             :pool {:connection-timeout "10s"}
+                             :defaults {:timeout "3s" :max-rows 1000}}}))
+      (write! dir "auth.edn" (auth-edn))
+      (write! dir "flows/it/read.edn" (pr-str {:steps [{:id :r :kind :sql :conn :ase :sql "select 1 as one, 'x' as s"}]
+                                                :endpoint {:path "/it/read" :scopes #{"it"}}}))
+      (write! dir "flows/it/sleep.edn" (sleeper-flow :ase ase-slow))
+      (is (= nil (:problems (config/reload! (str dir)))))
+      (let [h (server/handler {:node-id "it" :config-dir (str dir)})
+            ds {:jdbcUrl (env "SPINDLE_IT_ASE_URL") :user (env "SPINDLE_IT_ASE_USER") :password (env "SPINDLE_IT_ASE_PASSWORD")}
+            busy #(:n (jdbc/execute-one! ds ["select count(*) as n from master..sysprocesses where rtrim(program_name) = 'spindle' and rtrim(cmd) <> 'AWAITING COMMAND' and spid <> @@spid"]))]
+        (testing "read"
+          (is (= [{:one 1 :s "x"}] (get-in (call h :get "/it/read") [:json :rows]))))
+        (testing "showplan explain archived on reload"
+          (let [f (first (filter #(= "r.json" (.getName ^java.io.File %)) (file-seq (io/file spindle.explain/*archive-dir*))))]
+            (is (some? f) "explain file for it/read")
+            (when f (is (re-find #"(?i)query plan" (slurp f))))))
+        (testing "deadline → 504 and the statement is cancelled on the server"
+          (let [t0 (System/nanoTime) r (call h :get "/it/sleep") ms (/ (- (System/nanoTime) t0) 1e6)]
+            (is (= 504 (:status r)))
+            (is (< ms 2500) (str "returned after " ms " ms"))
+            (is (wait-until #(zero? (busy)) 3000) "no spindle spid still running a command")))
+        (testing "the pool still serves reads after a cancel"
+          (is (= [{:one 1 :s "x"}] (get-in (call h :get "/it/read") [:json :rows]))))))))

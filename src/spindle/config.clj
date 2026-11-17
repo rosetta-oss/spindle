@@ -147,7 +147,8 @@
          ;; hidden files (editor swap files, macOS ._ AppleDouble files) are not config
          (remove #(some (fn [^java.nio.file.Path p] (.startsWith (str p) "."))
                         (iterator-seq (.iterator (.relativize base (.toPath ^File %))))))
-         (map (fn [^File f] [(str (.relativize base (.toPath f))) (slurp f)]))
+         ;; "/" on every OS: flow ids and the flows/ prefix are matched on it
+         (map (fn [^File f] [(str/replace (str (.relativize base (.toPath f))) java.io.File/separator "/") (slurp f)]))
          (into (sorted-map)))))
 
 (defn tree-version [tree]
