@@ -67,6 +67,10 @@
         (is (= 3.0 (get-in r [:json :rows 0 :lines 0 :total])))
         (is (= "miss" (get-in r [:json :meta :cache])))
         (is (= "hit" (get-in (call h :get "/shop/orders" {:qs "id=1,2" :key api-key}) [:json :meta :cache])))))
+    (testing "home redirects to the console"
+      (let [r (h {:request-method :get :uri "/" :headers {}})]
+        (is (= 302 (:status r)))
+        (is (= "/console" (get-in r [:headers "Location"])))))
     (testing "bad params"
       (is (= 422 (:status (call h :get "/shop/orders" {:qs "id=abc" :key api-key})))))
     (testing "status + metrics"

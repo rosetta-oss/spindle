@@ -370,6 +370,8 @@
             (json-resp 503 {:status "not_ready"}))
           (= uri "/metrics") {:status 200 :headers {"Content-Type" "text/plain; version=0.0.4"} :body (metrics/scrape)}
           (= uri "/status") (json-resp 200 (status-body node-id (admin? snap store req)))
+          ;; home: the console is the front page
+          (and (= uri "/") (= :get (:request-method req))) {:status 302 :headers {"Location" "/console"} :body ""}
 
           (or (= uri "/console") (str/starts-with? uri "/console/"))
           (if (web/secure? req) (console-resp uri) (web/insecure-resp))
