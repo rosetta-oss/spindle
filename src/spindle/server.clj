@@ -249,10 +249,10 @@
             (json-resp 403 {:error {:code "forbidden" :message "admin scope required"}})
             (case (if (str/starts-with? uri "/admin/tokens") :tokens [(:request-method req) uri])
               :tokens (if store (token-admin snap store req) (json-resp 404 {:error {:code "not_found"}}))
-              [:post "/admin/reload"] (let [r (config/reload! config-dir)] (register-gauges!) (json-resp (if (:ok r) 200 422) r))
+              [:post "/admin/reload"] (let [r (config/with-write-lock (config/reload! config-dir))] (register-gauges!) (json-resp (if (:ok r) 200 422) r))
               [:post "/admin/config/rollback"]
               (let [v (get (query-string-params req) "to")
-                    r (config/rollback! v)] (json-resp (if (:ok r) 200 422) r))
+                    r (config/with-write-lock (config/rollback! v))] (json-resp (if (:ok r) 200 422) r))
               [:post "/admin/config/unpin"] (do (config/unpin!) (json-resp 200 {:pinned false}))
               [:post "/admin/cache/evict"]
               (let [tags (remove str/blank? (str/split (str (get (query-string-params req) "tag")) #","))]

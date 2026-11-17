@@ -188,6 +188,8 @@ SPINDLE_CONFIG_DIR=config bin/spindle                   # adds drivers/*.jar
 | `SPINDLE_EXPLAIN_DIR` | `explain-archive` | where plans are archived on publish |
 | `SPINDLE_EXPLAIN` | on | `off` disables the explain check (not recommended) |
 | `SPINDLE_STEP_CACHE_MB` | `256` | step-cache weight bound per node |
+| `SPINDLE_DB` | `data/spindle.db` | token store (SQLite); must not be inside the config directory |
+| `SPINDLE_TRUST_FORWARDED_PROTO` | `true` | trust `X-Forwarded-Proto: https` from the reverse proxy |
 
 **Operations:**
 
@@ -202,6 +204,34 @@ SPINDLE_CONFIG_DIR=config bin/spindle                   # adds drivers/*.jar
   - `POST /admin/cache/evict?tag=<tag>`
 - **Several nodes:** point every node at the same config source (a git checkout or a shared directory). Each node
   reports the version it is running. Each node has its own cache, so nodes can differ for at most the TTL.
+
+## Console, tokens and MCP
+
+- **Token store:** opened at start from `SPINDLE_DB` (default `data/spindle.db`, relative to the working
+  directory). Spindle refuses to start when this path is inside `SPINDLE_CONFIG_DIR`, so a config rollback can
+  never bring back a revoked token. Back up `data/`; it is git-ignored.
+- **Console** (`/console`, admin scope): issue tokens (shown once), list and revoke them. Keys in `auth.edn` show
+  read-only. Store tokens keep working through failed reloads and rollbacks.
+- **Scopes:**
+  - `spindle:admin` (or the `:admin-scope` in `auth.edn`): console, `/admin/*`, all MCP tools;
+  - `spindle:author`: the authoring MCP (introspection, `validate_flow`, `test_run`, `explain`, `publish`);
+  - `spindle:delegate`: may be put on store tokens, but is a separate, unchecked-by-default box with a warning;
+  - flow scopes (e.g. `sales:read`): call endpoints.
+- **Authoring MCP** at `/mcp` (Streamable HTTP). Add it to Claude Code with an author token:
+
+  ```bash
+  claude mcp add --transport http spindle https://<host>/mcp --header "Authorization: Bearer <token>"
+  ```
+
+  `publish` validates first, writes `flows/<id>.edn` (+ `.sql`) atomically, reloads, and restores the previous
+  files if the reload fails. Publish, `POST /admin/reload`, rollback and the file watcher share one lock.
+  Publish is refused (`node is pinned`) after a rollback; `POST /admin/config/unpin` first. Every publish is
+  logged as `event=flow-published flow=<id> by=<token id> version=<v>`.
+- **HTTPS:** `/console`, `/mcp` and `/admin/tokens*` refuse plain HTTP (403) unless the request comes from
+  loopback or carries `X-Forwarded-Proto: https`. Set `SPINDLE_TRUST_FORWARDED_PROTO=false` when Spindle is
+  reachable without the proxy, so clients cannot set that header themselves. Note that loopback is trusted:
+  a reverse proxy on the same host that forwards **plain HTTP** from loopback passes the guard too, so make sure
+  such a proxy only accepts HTTPS from the outside.
 
 ## Databases and drivers
 

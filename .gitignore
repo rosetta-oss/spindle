@@ -11,3 +11,4 @@ drivers/*
 secrets/
 *.log
 explain-archive/
+data/

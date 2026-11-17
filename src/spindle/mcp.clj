@@ -1,13 +1,16 @@
 (ns spindle.mcp
   "Authoring MCP: schema and flow introspection for agents. Streamable HTTP only
    (the legacy HTTP+SSE routes need :sse-writer and are not wired here)."
-  (:require [shuttle.http :as shttp]
+  (:require [clojure.tools.logging :as log]
+            [shuttle.http :as shttp]
             [shuttle.tools :as tools]
             [spindle.auth :as auth]
             [spindle.config :as config]
             [spindle.conn :as conn]
             [spindle.mcp.introspect :as introspect]
-            [spindle.mcp.trial :as trial]))
+            [spindle.mcp.trial :as trial])
+  (:import [java.nio.file CopyOption Files LinkOption Path StandardCopyOption]
+           [java.nio.file.attribute FileAttribute]))
 
 (def author-scope "spindle:author")
 (def version "0.1.0")
@@ -106,14 +109,66 @@
     :annotations {:readOnlyHint true}
     :handler (trial-tool (fn [{:keys [id edn sql params]}] (trial/explain id edn sql params)))}])
 
+(defn- write-atomic!
+  "bytes nil -> delete. Otherwise temp file in the same directory + ATOMIC_MOVE."
+  [^Path p ^bytes b]
+  (if (nil? b)
+    (Files/deleteIfExists p)
+    (let [dir (.getParent p)
+          _ (Files/createDirectories dir (make-array FileAttribute 0))
+          tmp (Files/createTempFile dir ".publish-" ".tmp" (make-array FileAttribute 0))]
+      (try (Files/write tmp b (make-array java.nio.file.OpenOption 0))
+           (Files/move tmp p (into-array CopyOption [StandardCopyOption/ATOMIC_MOVE StandardCopyOption/REPLACE_EXISTING]))
+           (finally (Files/deleteIfExists tmp))))))
+
+(defn- read-bytes [^Path p]
+  (when (Files/exists p (make-array LinkOption 0)) (Files/readAllBytes p)))
+
+(defn publish!
+  "Validate, write flows/<id>.edn (+ .sql; removed when sql is nil) atomically,
+   reload. On reload failure the previous files are restored exactly."
+  [config-dir caller id edn sql]
+  (config/with-write-lock
+    (if (:pinned @config/state)
+      {:error "node is pinned"}
+      (let [{ps :problems} (trial/validate id edn sql)]
+        (if ps
+          {:problems ps}
+          (let [flows (.normalize (.toAbsolutePath (.resolve (Path/of (str config-dir) (make-array String 0)) "flows")))
+                files (vec (for [[ext text] [[".edn" edn] [".sql" sql]]
+                                 :let [p (.normalize (.resolve flows (str id ext)))]]
+                             (do (when-not (.startsWith p flows) (throw (ex-info "invalid flow id" {})))
+                                 [p (some-> ^String text (.getBytes "UTF-8"))])))
+                before (mapv (fn [[p _]] [p (read-bytes p)]) files)
+                restore! #(doseq [[p b] before] (write-atomic! p b))]
+            (try (doseq [[p b] files] (write-atomic! p b))
+                 (catch Throwable t (restore!) (throw t)))
+            (let [r (try (config/reload! config-dir)
+                         (catch Throwable t {:problems [{:message (or (ex-message t) "reload failed")}]}))]
+              (if (:ok r)
+                (do (log/info (str "event=flow-published flow=" id " by=" (:id caller) " version=" (:ok r)))
+                    {:version (:ok r) :reload r})
+                (do (restore!)
+                    {:error "reload failed" :problems (:problems r)})))))))))
+
+(defn- publish-tool [config-dir]
+  {:name "publish"
+   :description "Validate and publish a flow: writes flows/<id>.edn (+ .sql) atomically and reloads. Refused while the node is pinned."
+   :input [:map [:id :string] [:edn :string] [:sql {:optional true} :string]]
+   :handler (fn [ctx {:keys [id edn sql]}]
+              (if-not (valid-flow-id? id)
+                {:error "invalid flow id"}
+                (try (publish! config-dir ctx id edn sql)
+                     (catch Throwable t {:error (or (ex-message t) "failed")}))))})
+
 (def default-tools (into read-tools trial-tools))
 
 (defn handler
-  "Ring handler for /mcp (nil for other paths). Task 7 extends `tools`."
-  [{:keys [store]} & [tools]]
+  "Ring handler for /mcp (nil for other paths). `publish` is offered when :config-dir is set."
+  [{:keys [store config-dir]} & [tools]]
   (shttp/routes
    (merge
-    (tools/deps (vec (or tools default-tools)))
+    (tools/deps (vec (or tools (cond-> default-tools config-dir (conj (publish-tool config-dir))))))
     {:authenticate (fn [req]
                      (let [snap (config/current)
                            caller (try (auth/authenticate (:auth snap) store req) (catch Throwable _ nil))

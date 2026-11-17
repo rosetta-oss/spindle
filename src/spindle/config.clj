@@ -247,6 +247,17 @@
 
 (defn current [] (:snapshot @state))
 
+(defonce ^java.util.concurrent.locks.ReentrantLock write-lock
+  (java.util.concurrent.locks.ReentrantLock.))
+
+(defmacro with-write-lock
+  "Runs body holding the process-wide lock shared by publish, /admin/reload,
+   rollback and the file watcher."
+  [& body]
+  `(let [l# write-lock]
+     (.lock l#)
+     (try ~@body (finally (.unlock l#)))))
+
 (defn- retire!
   "Close runtime connections of `old` that `new` no longer uses, once no request holds `old`."
   [old new]
@@ -311,12 +322,13 @@
      (loop []
        (Thread/sleep (long interval-ms))
        (try
-         (when-not (:pinned @state)
-           (let [tree (read-tree dir)
-                 v (tree-version tree)]
-             ;; reload on change; a rejected version is not retried until the files change again
-             (when (and (not= v (:version (current))) (not= v (:rejected-version @state)))
-               (when (:problems (reload! dir tree))
-                 (swap! state assoc :rejected-version v)))))
+         (with-write-lock
+           (when-not (:pinned @state)
+             (let [tree (read-tree dir)
+                   v (tree-version tree)]
+               ;; reload on change; a rejected version is not retried until the files change again
+               (when (and (not= v (:version (current))) (not= v (:rejected-version @state)))
+                 (when (:problems (reload! dir tree))
+                   (swap! state assoc :rejected-version v))))))
          (catch Throwable t (log/warn t "config watcher error")))
        (recur)))))
