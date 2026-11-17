@@ -59,7 +59,7 @@
   (try (with-open [st (.createStatement c) rs (.executeQuery st "select 1")] (.next rs) (= 1 (.getInt rs 1)))
        (catch Exception e (str "NO: " (.getMessage e)))))
 
-(def waitfor "waitfor delay \"00:00:30\"")
+(def waitfor "waitfor delay '00:00:30'")  ; single quotes: jConnect turns quoted_identifier on
 
 (defn- report [nm t0 outcome s c]
   (Thread/sleep 300)
@@ -115,7 +115,7 @@
     ;; Spindle flows only run read statements, so `waitfor` cannot be used here.
     ;; A 4-way cross join over master..sysobjects (~10^9 rows) runs far longer than
     ;; the 5 s deadline; the test checks that Spindle cancels it at the deadline.
-    (w "flows/t/wait.edn" (pr-str {:steps [{:id :w :kind :sql :conn :ase
+    (w "flows/t/wait.edn" (pr-str {:steps [{:id :w :kind :sql :conn :ase :tuning {:timeout "5s"} :max-rows 10
                                             :sql "select count(*) as n from master..sysobjects a, master..sysobjects b, master..sysobjects c, master..sysobjects d"}]
                                    :limits {:timeout "5s"} :endpoint {:path "/t/wait" :scopes #{"t"}}}))
     (let [r (config/reload! (str dir))]

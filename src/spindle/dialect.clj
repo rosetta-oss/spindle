@@ -57,6 +57,11 @@
    :sybase-ase
    {:driver "com.sybase.jdbc4.jdbc.SybDriver"
     :app-name (fn [props nm] (assoc props "APPLICATIONNAME" nm))
+    ;; Verified on ASE (spikes/jconnect-cancel): with jConnect's default, a query
+    ;; timeout only stops reading; the statement keeps running on the server.
+    ;; QUERY_TIMEOUT_CANCELS_ALL=true makes the timeout cancel it. A connection's
+    ;; :properties still override this.
+    :property-defaults {"QUERY_TIMEOUT_CANCELS_ALL" "true"}
     :isolation? true :transactions? true :procedures? true
     :max-in 250
     :explain :showplan

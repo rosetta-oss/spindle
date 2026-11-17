@@ -150,8 +150,10 @@
           (try
             (execute-rows ps write? max-rows)
             (catch Throwable t
-              (vreset! broken (.get cancelled))
               (let [code (classify t (.get cancelled))]
+                ;; cancelled or timed out: the connection may be mid-protocol, or (a driver
+                ;; timeout that did not cancel) the statement may still run on the server
+                (vreset! broken (or (.get cancelled) (= code :timeout)))
                 (err/fail! code (if (= code :timeout) "statement cancelled or timed out" "statement failed")
                            {:step step-id :conn (:id rt)} t)))
             (finally (deregister-cancel! cancels cancel-key))))

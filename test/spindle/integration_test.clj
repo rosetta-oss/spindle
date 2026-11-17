@@ -172,6 +172,10 @@
       (write! dir "flows/it/read.edn" (pr-str {:steps [{:id :r :kind :sql :conn :ase :sql "select 1 as one, 'x' as s"}]
                                                 :endpoint {:path "/it/read" :scopes #{"it"}}}))
       (write! dir "flows/it/sleep.edn" (sleeper-flow :ase ase-slow))
+      ;; step timeout (1 s) well inside the flow deadline (10 s): only the driver's query timeout fires
+      (write! dir "flows/it/qtimeout.edn" (pr-str {:steps [{:id :s :kind :sql :conn :ase :sql ase-slow :tuning {:timeout "1s"}}]
+                                                    :limits {:timeout "10s"}
+                                                    :endpoint {:path "/it/qtimeout" :scopes #{"it"}}}))
       (is (= nil (:problems (config/reload! (str dir)))))
       (let [h (server/handler {:node-id "it" :config-dir (str dir)})
             ds {:jdbcUrl (env "SPINDLE_IT_ASE_URL") :user (env "SPINDLE_IT_ASE_USER") :password (env "SPINDLE_IT_ASE_PASSWORD")}
@@ -186,6 +190,11 @@
           (let [t0 (System/nanoTime) r (call h :get "/it/sleep") ms (/ (- (System/nanoTime) t0) 1e6)]
             (is (= 504 (:status r)))
             (is (< ms 2500) (str "returned after " ms " ms"))
+            (is (wait-until #(zero? (busy)) 3000) "no spindle spid still running a command")))
+        (testing "step query timeout → the statement is stopped on the server too"
+          (let [t0 (System/nanoTime) r (call h :get "/it/qtimeout") ms (/ (- (System/nanoTime) t0) 1e6)]
+            (is (= 504 (:status r)))
+            (is (< ms 5000) (str "returned after " ms " ms"))
             (is (wait-until #(zero? (busy)) 3000) "no spindle spid still running a command")))
         (testing "the pool still serves reads after a cancel"
           (is (= [{:one 1 :s "x"}] (get-in (call h :get "/it/read") [:json :rows]))))))))

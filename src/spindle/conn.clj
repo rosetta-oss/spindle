@@ -131,7 +131,7 @@
 (defn- open-pool ^HikariDataSource [conn-id generation {:keys [jdbc-url username password driver properties pool]
                                                         dk :dialect :as cfg}]
   (let [d (dialect/get-dialect dk)
-        props ((:app-name d) (into {} (map (fn [[k v]] [(name k) (str v)])) properties) "spindle")
+        props ((:app-name d) (into (or (:property-defaults d) {}) (map (fn [[k v]] [(name k) (str v)])) properties) "spindle")
         hc (doto (HikariConfig.)
              (.setPoolName (str "spindle-" (name conn-id) "-" generation))
              (.setJdbcUrl (dialect/url-for d jdbc-url))

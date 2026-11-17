@@ -6,18 +6,25 @@ Where work continues after 2026-11-17. Everything up to `04110f7` was built and 
 
 ## 1. Set up in the company environment
 
-- [ ] Put `jconn4.jar` in `drivers/` (never committed) and run `clojure -M:test`. The ASE tests skip themselves
+- [x] Put `jconn4.jar` in `drivers/` (never committed) and run `clojure -M:test`. The ASE tests skip themselves
       until `SPINDLE_IT_ASE_URL`, `SPINDLE_IT_ASE_USER` and `SPINDLE_IT_ASE_PASSWORD` are set.
+      2026-11-17: done on dev ASE (dev.synnex.org/CIS): 112 tests, 0 failures.
 - [ ] Use a read-only login for reads, and a separate test database (or schema) for `:proc` and write tests.
       Never point write tests at a shared database.
 - [ ] Follow "Taking it over in the company environment" in `README.md` (config directory, keys, explain archive).
 
 ## 2. Verify on ASE (blocks real use)
 
-- [ ] **Cancel:** run `spikes/jconnect-cancel` (`waitfor delay` cancelled at the deadline). Check that the
+- [x] **Cancel:** run `spikes/jconnect-cancel` (`waitfor delay` cancelled at the deadline). Check that the
       statement stops on the server (`sysprocesses`), and that the evicted connection is not reused.
       Check `CANCEL_ALL` and `QUERY_TIMEOUT_CANCELS_ALL`.
-- [ ] **Explain:** showplan with `set noexec on` during reload; check the archived plan in `SPINDLE_EXPLAIN_DIR`.
+      2026-11-17 on dev ASE (jConnect 16, Oct 2022): `Statement.cancel()` (promise and direct) stops the
+      statement on the server within ~0.5 s and the connection stays usable, with CANCEL_ALL true or false. A bare
+      `setQueryTimeout` stops reading only: the spid stays in WAITFOR. With `QUERY_TIMEOUT_CANCELS_ALL=true` it stops
+      too, so the ASE dialect now sets that by default, and timed-out connections are evicted. Spindle's own
+      deadline cancels at the step timeout anyway (flow 504 after ~5.4 s, nothing left running).
+- [x] **Explain:** showplan with `set noexec on` during reload; check the archived plan in `SPINDLE_EXPLAIN_DIR`.
+      2026-11-17: the integration test archives a showplan on reload and it passes on dev ASE.
 - [ ] **`:proc`:**
   - [ ] several result sets named with `:results`;
   - [ ] return status with `:status` / `:fail-on-status :non-zero`;
@@ -35,8 +42,15 @@ Where work continues after 2026-11-17. Everything up to `04110f7` was built and 
       (adjust types: `text`, `timestamp` → `datetime`). Check that duplicate-key detection works (error 2601/2627).
 - [ ] **Paging on ASE:** use `top` or `set rowcount` instead of `limit` with `[:page :limit]`.
       Write an example flow in the cookbook.
-- [ ] **Long `IN` lists:** confirm chunks of 250 and the plans; try `:parallel` on chunked steps.
+      2026-11-17: not supported, by decision. `top` takes no parameter and the first page binds NULL
+      (source_error). On ASE use a fixed `top` ceiling + `:take [:params :limit]` + a `before` key with a default
+      (cookbook §8); the dev orders endpoint allows up to 5000 rows.
+- [x] **Long `IN` lists:** confirm chunks of 250 and the plans; try `:parallel` on chunked steps.
+      2026-11-17: 600 keys → 3 chunks of 250, all 600 rows, 2.2 s; with `:parallel {:dev 2}` 1.7 s.
+      Plans for chunked statements not yet inspected.
 - [ ] **NULL binding:** `setNull` fallback (JZ0SE) with `isnull(?, ...)` patterns.
+      2026-11-17: still fails through Spindle on ASE (`:after is null`, also with `convert(int, :after)`).
+      Workaround: parameter `:default`s, so no NULL is ever bound.
 
 ## 3. First real graph (the first-release goal)
 
