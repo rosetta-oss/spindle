@@ -23,7 +23,8 @@
       :admin-scope \"spindle:admin\"}"
   (:require [clojure.string :as str]
             [jsonista.core :as json]
-            [spindle.error :as err])
+            [spindle.error :as err]
+            [spindle.tokens :as tokens])
   (:import [java.security MessageDigest]
            [java.util Base64]))
 
@@ -64,13 +65,19 @@
       {:sub (some-> sub str/trim) :claims (or (decode-claims claims) {})})))
 
 (defn authenticate
-  "→ caller {:client id :scopes #{..} :sub? :claims?} or nil when no/unknown key."
-  [auth req]
-  (when-let [k (presented-key req)]
-    (let [h (sha256-hex k)]
-      (when-let [entry (some #(when (constant-time= (:sha256 %) h) %) (:keys auth))]
-        (let [caller {:client (:id entry) :id (:id entry) :scopes (:scopes entry)}]
-          (merge caller (end-user req caller)))))))
+  "→ caller {:client id :scopes #{..} :sub? :claims?} or nil when no/unknown key.
+   auth.edn keys are tried first, then the token store (when non-nil)."
+  ([auth req] (authenticate auth nil req))
+  ([auth store req]
+   (when-let [k (presented-key req)]
+     (let [h (sha256-hex k)
+           entry (or (some #(when (constant-time= (:sha256 %) h) %) (:keys auth))
+                     (when store
+                       (when-let [{:keys [id scopes]} (tokens/lookup store h)]
+                         {:id id :scopes (set scopes)})))]
+       (when entry
+         (let [caller {:client (:id entry) :id (:id entry) :scopes (:scopes entry)}]
+           (merge caller (end-user req caller))))))))
 
 (defn allowed? [caller required]
   (and caller (every? (:scopes caller) required)))

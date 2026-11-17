@@ -3,8 +3,7 @@
    persisted; the clear token is returned once by issue! and never logged."
   (:require [jsonista.core :as json]
             [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs]
-            [spindle.auth :as auth])
+            [next.jdbc.result-set :as rs])
   (:import [com.github.benmanes.caffeine.cache Caffeine Ticker]
            [java.nio.file Files Path Paths]
            [java.security SecureRandom]
@@ -20,6 +19,10 @@
   (list-tokens [s] "all tokens, without hashes"))
 
 (def ^:private rng (SecureRandom.))
+
+(defn- sha256-hex [^String s]
+  (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") (.getBytes s "UTF-8"))]
+    (apply str (map #(format "%02x" %) d))))
 
 (defn new-token []
   (let [b (byte-array 32)]
@@ -87,7 +90,7 @@
                expires (some-> expires-at parse-ms iso)]
            (try
              (jdbc/execute! ds ["insert into tokens(id, sha256, scopes, created_at, created_by, expires_at) values (?,?,?,?,?,?)"
-                                id (auth/sha256-hex token) (json/write-value-as-string (vec (sort scopes)))
+                                id (sha256-hex token) (json/write-value-as-string (vec (sort scopes)))
                                 created created-by expires])
              (catch SQLException e
                (if (conflict? e)

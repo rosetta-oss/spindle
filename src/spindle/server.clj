@@ -89,8 +89,8 @@
                [(java.net.URLDecoder/decode ^String k "UTF-8") (java.net.URLDecoder/decode (str v) "UTF-8")]))
     {}))
 
-(defn- run-endpoint [snap ep match req request-id]
-  (let [caller (auth/authenticate (:auth snap) req)]
+(defn- run-endpoint [snap store ep match req request-id]
+  (let [caller (auth/authenticate (:auth snap) store req)]
     (when-not caller (err/fail! :unauthenticated "missing or invalid API key"))
     (when-not (auth/allowed? caller (:scopes ep)) (err/fail! :forbidden "missing scope"))
     (when (and (= :required (:caller ep)) (not (:sub caller)))
@@ -157,10 +157,10 @@
       (metrics/gauge! "spindle_bulkhead_queued" {:conn cid}
                       #(when-let [r (rt)] (.getQueueLength ^java.util.concurrent.Semaphore (get-in r [:guards :bulkhead])))))))
 
-(defn- admin? [snap req]
-  (auth/allowed? (auth/authenticate (:auth snap) req) #{(get-in snap [:auth :admin-scope])}))
+(defn- admin? [snap store req]
+  (auth/allowed? (auth/authenticate (:auth snap) store req) #{(get-in snap [:auth :admin-scope] "spindle:admin")}))
 
-(defn handler [{:keys [node-id config-dir]}]
+(defn handler [{:keys [node-id config-dir store]}]
   (fn [req]
     (let [request-id (str (UUID/randomUUID))
           uri (:uri req)
@@ -175,10 +175,10 @@
             (json-resp 200 {:status "ready" :config_version (:version snap)})
             (json-resp 503 {:status "not_ready"}))
           (= uri "/metrics") {:status 200 :headers {"Content-Type" "text/plain; version=0.0.4"} :body (metrics/scrape)}
-          (= uri "/status") (json-resp 200 (status-body node-id (admin? snap req)))
+          (= uri "/status") (json-resp 200 (status-body node-id (admin? snap store req)))
 
           (str/starts-with? uri "/admin/")
-          (if-not (admin? snap req)
+          (if-not (admin? snap store req)
             (json-resp 403 {:error {:code "forbidden" :message "admin scope required"}})
             (case [(:request-method req) uri]
               [:post "/admin/reload"] (let [r (config/reload! config-dir)] (register-gauges!) (json-resp (if (:ok r) 200 422) r))
@@ -199,7 +199,7 @@
                 (let [^java.util.concurrent.atomic.AtomicLong inflight (:inflight snap)]
                   (.incrementAndGet inflight)
                   (try
-                    (let [{:keys [body]} (run-endpoint snap ep match req request-id)]
+                    (let [{:keys [body]} (run-endpoint snap store ep match req request-id)]
                       (metrics/timer! "spindle_request_seconds" {:endpoint (:id ep) :outcome "ok"} (- (System/nanoTime) t0))
                       (json-resp 200 body))
                     (catch Throwable e
