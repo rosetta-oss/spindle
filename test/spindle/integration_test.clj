@@ -193,6 +193,12 @@
                                 :sql "select top 2 id from master..sysobjects where (:before is null or id < :before) order by id desc"
                                 :in {:before [:params :before]}}]
                        :endpoint {:path "/it/nullint" :scopes #{"it"}}}))
+      (write! dir "flows/it/nullint2.edn"
+              (pr-str {:params [:map [:id 'pos-int?] [:before {:optional true} 'pos-int?]]
+                       :steps [{:id :s :kind :sql :conn :ase :skip-when-empty false
+                                :sql "select id from master..sysobjects where id = :id and (:before is null or id < :before)"
+                                :in {:id [:params :id] :before [:params :before]}}]
+                       :endpoint {:path "/it/nullint2" :scopes #{"it"}}}))
       (is (= nil (:problems (config/reload! (str dir)))))
       (let [h (server/handler {:node-id "it" :config-dir (str dir)})
             ds {:jdbcUrl (env "SPINDLE_IT_ASE_URL") :user (env "SPINDLE_IT_ASE_USER") :password (env "SPINDLE_IT_ASE_PASSWORD")}
@@ -222,6 +228,8 @@
         (testing ":proc — OUT parameter and return status"
           (is (= [{:msg "timeouts" :status 0}] (get-in (call h :get "/it/msg" "n=17000") [:json :rows])))
           (is (= 502 (:status (call h :get "/it/msg" "n=1999999999")))))
+        (testing "an omitted optional parameter does not drop the others"
+          (is (= 1 (count (get-in (call h :get "/it/nullint2" "id=1") [:json :rows])))))
         (testing "NULL for an omitted int parameter"
           (let [r (call h :get "/it/nullint")]
             (is (= 200 (:status r)) (pr-str (:json r)))

@@ -393,16 +393,18 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- sql-values [{:keys [scanned in]} env]
-  ;; → {:values {...}} or {:empty true}
+  ;; → {:values {...} :empty bool}. Every input is resolved even after an empty one:
+  ;; with :skip-when-empty false the statement runs, and an empty input is NULL
+  ;; (or an empty IN list) while the others keep their values.
   (reduce (fn [acc {:keys [param list?]}]
             (let [v (paths/resolve-path (get in param) env)]
               (if list?
                 (let [l (paths/as-list v)]
-                  (if (empty? l) (reduced {:empty true}) (assoc-in acc [:values param] l)))
+                  (cond-> (assoc-in acc [:values param] (vec l)) (empty? l) (assoc :empty true)))
                 (if (= :page (first (get in param)))
                   (assoc-in acc [:values param] v)        ; keyset paging: nil on the first page is NULL, not "skip"
                   (let [{:keys [value empty]} (paths/as-scalar v param)]
-                    (if empty (reduced {:empty true}) (assoc-in acc [:values param] value)))))))
+                    (cond-> (assoc-in acc [:values param] (when-not empty value)) empty (assoc :empty true)))))))
           {:values {}}
           (distinct (filter map? scanned))))
 
