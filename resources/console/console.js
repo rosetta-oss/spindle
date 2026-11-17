@@ -1,9 +1,10 @@
 'use strict';
 (function () {
   var TOKEN_KEY = 'spindle.token';
-  var TABS = ['Overview', 'Activity', 'Connections', 'Endpoints', 'Caches', 'Config', 'Tokens'];
+  var TABS = ['Overview', 'Activity', 'Connections', 'Endpoints', 'Try it', 'Caches', 'Config', 'Tokens'];
   var state = { tab: 'Overview', status: null, tokens: null, showRevoked: false, timer: null,
-                activity: null, window: 'last_5m', expanded: {} };
+                activity: null, window: 'last_5m', expanded: {},
+                openapi: null, tryPath: null, tryValues: {}, callToken: '' };
   // Activity thresholds: rows above them are flagged
   var MAX_ERROR_RATE = 0.05, MAX_P95_MS = 5000;
 
@@ -49,7 +50,7 @@
   function logout(msg) {
     setToken(null);
     stopPolling();
-    state.status = null; state.tokens = null;
+    state.status = null; state.tokens = null; state.openapi = null; state.callToken = ''; state.tryValues = {};
     $('app').hidden = true;
     $('login').hidden = false;
     $('login-error').textContent = msg || '';
@@ -133,7 +134,7 @@
     var view = $('view');
     view.textContent = '';
     var c = el('div', { id: 'controls' });
-    var builder = { Activity: activityControls, Caches: cacheControls, Tokens: tokenControls }[state.tab];
+    var builder = { Activity: activityControls, Caches: cacheControls, Tokens: tokenControls, 'Try it': tryControls }[state.tab];
     if (builder) builder(c);
     view.appendChild(c);
     view.appendChild(el('div', { id: 'data' }));
@@ -142,7 +143,8 @@
   function renderData(s) {
     var d = $('data');
     d.textContent = '';
-    var f = { Overview: overview, Activity: activityTab, Connections: connections, Endpoints: endpoints, Caches: caches, Config: configTab, Tokens: tokensTab }[state.tab];
+    var f = { Overview: overview, Activity: activityTab, Connections: connections, Endpoints: endpoints, 'Try it': function () { return document.createTextNode(''); },
+              Caches: caches, Config: configTab, Tokens: tokensTab }[state.tab];
     d.appendChild(f(s));
   }
 
@@ -318,6 +320,92 @@
       $('banner').textContent = r.ok ? '' : 'Revoke failed: ' + errMsg(r);
       refresh();
     }).catch(fail);
+  }
+
+  // ---- try it ----
+  // Calls a published endpoint with a caller's token (not the admin token: endpoints check
+  // their own scopes). The token stays in memory only. Everything lives in the controls area,
+  // so polling never wipes the form or the result.
+  function tryControls(c) {
+    var box = el('div', { id: 'try' }, [el('p', { class: 'muted', text: 'Loading endpoints…' })]);
+    c.appendChild(box);
+    var p = state.openapi ? Promise.resolve() : api('GET', '/openapi.json').then(function (r) {
+      if (r.ok) state.openapi = r.body; else throw new Error(errMsg(r));
+    });
+    p.then(function () { buildTry(box); }).catch(function (e) {
+      if (e && e.message !== 'auth') box.textContent = 'Could not load endpoints: ' + e.message;
+    });
+  }
+  function tryOps() {
+    var paths = (state.openapi && state.openapi.paths) || {};
+    return Object.keys(paths).filter(function (p) { return paths[p].get; }).sort()
+      .map(function (p) { return { path: p, op: paths[p].get }; });
+  }
+  function buildTry(box) {
+    box.textContent = '';
+    var ops = tryOps();
+    if (!ops.length) { box.appendChild(el('p', { class: 'muted', text: 'No GET endpoints are published.' })); return; }
+    if (!state.tryPath || !ops.some(function (o) { return o.path === state.tryPath; })) state.tryPath = ops[0].path;
+    var sel = el('select', { id: 'try-endpoint' }, ops.map(function (o) {
+      var opt = el('option', { value: o.path, text: 'GET ' + o.path });
+      if (o.path === state.tryPath) opt.selected = true;
+      return opt;
+    }));
+    sel.addEventListener('change', function () { state.tryPath = sel.value; state.tryValues = {}; buildTry(box); });
+    var tok = el('input', { id: 'try-token', type: 'password', autocomplete: 'off', placeholder: 'token with the endpoint’s scope' });
+    tok.value = state.callToken;
+    tok.addEventListener('input', function () { state.callToken = tok.value.trim(); });
+    var op = ops.filter(function (o) { return o.path === state.tryPath; })[0].op;
+    var fields = (op.parameters || []).filter(function (p) { return p.in === 'query'; }).map(function (p) {
+      var sc = p.schema || {};
+      var hint = [sc.type, sc.description, sc.minimum != null ? 'min ' + sc.minimum : null,
+                  sc.maximum != null ? 'max ' + sc.maximum : null, sc.pattern ? 'pattern ' + sc.pattern : null]
+        .filter(function (x) { return x != null; }).join(', ');
+      var inp = el('input', { 'data-param': p.name, placeholder: hint });
+      inp.value = state.tryValues[p.name] || '';
+      inp.addEventListener('input', function () { state.tryValues[p.name] = inp.value; });
+      return el('label', {}, [el('span', { text: p.name + (p.required ? ' *' : '') }), inp]);
+    });
+    var out = el('div', { id: 'try-result' });
+    var send = el('button', { id: 'try-send', text: 'Send', type: 'submit' });
+    var form = el('form', { class: 'try-form' }, [
+      el('label', {}, [el('span', { text: 'Endpoint' }), sel]),
+      el('label', {}, [el('span', { text: 'Call as' }), tok]),
+      el('p', { class: 'muted', text: 'Paste a token issued with this endpoint’s scope (Tokens tab). It is kept in this page only.' })
+    ].concat(fields).concat([el('div', { class: 'actions' }, [send])]));
+    form.addEventListener('submit', function (e) { e.preventDefault(); sendTry(op, out, send); });
+    box.appendChild(form);
+    box.appendChild(out);
+  }
+  function tryUrl(op) {
+    var qs = (op.parameters || []).filter(function (p) { return p.in === 'query'; })
+      .map(function (p) { var v = (state.tryValues[p.name] || '').trim(); return v ? encodeURIComponent(p.name) + '=' + encodeURIComponent(v) : null; })
+      .filter(Boolean).join('&');
+    return state.tryPath + (qs ? '?' + qs : '');
+  }
+  function sendTry(op, out, send) {
+    out.textContent = '';
+    var missing = (op.parameters || []).filter(function (p) { return p.required && !(state.tryValues[p.name] || '').trim(); }).map(function (p) { return p.name; });
+    if (missing.length) { out.appendChild(el('p', { class: 'error', text: 'Required: ' + missing.join(', ') })); return; }
+    if (!state.callToken) { out.appendChild(el('p', { class: 'error', text: 'Paste a token to call as.' })); return; }
+    var url = tryUrl(op), t0 = performance.now();
+    send.disabled = true;
+    // plain fetch, not api(): a 401/403 here is about the caller's token, not the admin session
+    fetch(url, { headers: { Authorization: 'Bearer ' + state.callToken } }).then(function (r) {
+      return r.text().then(function (t) {
+        var ms = Math.round(performance.now() - t0), j = null;
+        try { j = t ? JSON.parse(t) : null; } catch (e) { /* not json */ }
+        var rows = j && j.rows;
+        var meta = 'HTTP ' + r.status + ' · ' + ms + ' ms' + (Array.isArray(rows) ? ' · ' + rows.length + ' rows' : '') +
+                   (j && j.meta && j.meta.request_id ? ' · ' + j.meta.request_id : '') +
+                   (j && j.error && j.error.request_id ? ' · ' + j.error.request_id : '');
+        out.appendChild(el('p', {}, [badge(r.status, r.ok ? 'ok' : 'bad'), ' ' + meta]));
+        out.appendChild(el('code', { class: 'try-curl', text: 'curl -H "Authorization: Bearer $TOKEN" "' + location.origin + url + '"' }));
+        out.appendChild(el('pre', { class: 'try-body', text: j ? JSON.stringify(j, null, 2) : t }));
+      });
+    }).catch(function (e) {
+      out.appendChild(el('p', { class: 'error', text: 'Request failed: ' + e.message }));
+    }).then(function () { send.disabled = false; });
   }
 
   // ---- issue dialog ----

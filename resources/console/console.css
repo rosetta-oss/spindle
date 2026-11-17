@@ -2,7 +2,7 @@
 * { box-sizing: border-box; }
 body { margin:0; font:14px/1.4 system-ui, sans-serif; color:var(--fg); background:var(--bg); }
 header { display:flex; justify-content:space-between; align-items:center; padding:.75rem 1rem; background:var(--card); border-bottom:1px solid var(--line); }
-nav { display:flex; gap:.25rem; padding:0 1rem; background:var(--card); border-bottom:1px solid var(--line); }
+nav { display:flex; flex-wrap:wrap; gap:.25rem; padding:0 1rem; background:var(--card); border-bottom:1px solid var(--line); }
 nav button { border:0; background:none; padding:.6rem .9rem; cursor:pointer; color:var(--muted); border-bottom:2px solid transparent; }
 nav button.active { color:var(--fg); border-bottom-color:var(--accent); }
 main { padding:1rem; }
@@ -35,3 +35,12 @@ code#secret-value { display:block; word-break:break-all; padding:.6rem; backgrou
 button.link { background:none; border:0; padding:0; color:var(--accent); cursor:pointer; font:inherit; text-align:left; }
 tr.flagged td { background:#fff4f3; }
 tr.detail td { color:var(--muted); font-size:12px; }
+/* try it */
+.try-form { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.75rem 1rem; max-width:44rem; }
+.try-form label { display:grid; grid-template-columns:9rem 1fr; gap:.5rem; align-items:center; margin:.4rem 0; }
+.try-form input, .try-form select { width:100%; padding:.35rem; font:inherit; }
+.try-form .muted { margin:.2rem 0 .6rem 9.5rem; font-size:12px; }
+#try-result { margin-top:1rem; max-width:100%; }
+.try-curl { display:block; padding:.4rem .6rem; background:var(--card); border:1px solid var(--line); margin:.4rem 0; word-break:break-all; font-size:12px; }
+.try-body { background:var(--card); border:1px solid var(--line); padding:.6rem; max-height:60vh; overflow:auto; font-size:12px; }
+@media (max-width: 600px) { .try-form label { grid-template-columns:1fr; } .try-form .muted { margin-left:0; } }

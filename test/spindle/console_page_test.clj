@@ -23,7 +23,12 @@
 (deftest static-assets
   (let [js (get* "/console/console.js")]
     (is (= 200 (:status js)))
-    (is (re-find #"text/javascript" (get-in js [:headers "Content-Type"]))))
+    (is (re-find #"text/javascript" (get-in js [:headers "Content-Type"])))
+    (let [src (slurp (:body js))]
+      (testing "Try it: built from /openapi.json; calls with the caller's token, never stored"
+        (is (re-find #"'Try it'" src))
+        (is (re-find #"api\('GET', '/openapi.json'\)" src))
+        (is (not (re-find #"setItem\([^)]*callToken" src))))))
   (is (re-find #"text/css" (get-in (get* "/console/console.css") [:headers "Content-Type"]))))
 
 (deftest traversal-and-missing
