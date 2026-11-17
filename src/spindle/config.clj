@@ -353,7 +353,7 @@
                     :endpoints endpoints
                     :router router
                     :caches caches
-                    :auth (auth/compile-auth auth-raw)
+                    :auth (auth/compile-auth auth-raw (into #{} (mapcat :scopes) endpoints))
                     :inflight (AtomicLong. 0)}})))))
 
 ;; ---------------------------------------------------------------------------

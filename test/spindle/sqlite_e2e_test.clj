@@ -174,3 +174,29 @@ select count(*) as n from orders")
       (Thread/sleep 1300)
       (let [r (call h :get "/shop/orders" {:qs "id=2" :key api-key})]
         (is (= 200 (:status r)) (pr-str (:json r)))))))
+
+(deftest dev-token-is-local-and-opt-in
+  (is (:ok (config/reload! *dir*)))
+  (let [h (server/handler {:node-id "t" :config-dir *dir*})
+        dev "dev-0123456789abcdef"
+        req (fn [uri addr & [tok]]
+              (let [r (h {:request-method :get :uri uri :remote-addr addr :query-string "id=1"
+                          :headers (cond-> {} tok (assoc "authorization" (str "Bearer " tok)))})]
+                (assoc r :json (json/read-value (:body r) (json/object-mapper {:decode-key-fn true})))))]
+    (testing "unset: no hand-over and the value is not a key"
+      (binding [auth/*dev-token* (constantly nil)]
+        (is (= 404 (:status (req "/console/dev-token" "127.0.0.1"))))
+        (is (= 401 (:status (req "/shop/orders" "127.0.0.1" dev))))))
+    (binding [auth/*dev-token* (constantly dev)]
+      (testing "set, from this machine: handed over, and it calls endpoints and admin routes"
+        (is (= dev (get-in (req "/console/dev-token" "127.0.0.1") [:json :token])))
+        (is (= dev (get-in (req "/console/dev-token" "[0:0:0:0:0:0:0:1]") [:json :token])))
+        (is (= 200 (:status (req "/shop/orders" "127.0.0.1" dev))))
+        (is (= 200 (:status (req "/admin/activity" "127.0.0.1" dev)))))
+      (testing "set, from another machine: neither handed over nor accepted"
+        (is (= 404 (:status (req "/console/dev-token" "10.1.2.3"))))
+        (is (= 401 (:status (req "/shop/orders" "10.1.2.3" dev))))))
+    (testing "a value shorter than 16 characters is ignored"
+      (binding [auth/*dev-token* (constantly "short")]
+        (is (= 404 (:status (req "/console/dev-token" "127.0.0.1"))))
+        (is (= 401 (:status (req "/shop/orders" "127.0.0.1" "short"))))))))

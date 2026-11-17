@@ -38,10 +38,39 @@
 (defn- constant-time= [^String a ^String b]
   (MessageDigest/isEqual (.getBytes (str a) "UTF-8") (.getBytes (str b) "UTF-8")))
 
-(defn compile-auth [{:keys [api-keys admin-scope] jwt-cfgs :jwt}]
-  {:keys (mapv (fn [{:keys [id sha256 scopes]}] {:id id :sha256 (str/lower-case (str sha256)) :scopes (set scopes)}) api-keys)
-   :issuers (jwt/compile-issuers jwt-cfgs)
-   :admin-scope (or admin-scope "spindle:admin")})
+;; ---------------------------------------------------------------------------
+;; development token (opt in: SPINDLE_DEV_TOKEN)
+;; ---------------------------------------------------------------------------
+
+(def ^:dynamic *dev-token*
+  "SPINDLE_DEV_TOKEN, read per call (injectable for tests). Unset means no dev token."
+  #(System/getenv "SPINDLE_DEV_TOKEN"))
+
+(defn dev-token
+  "The development token when one is configured (at least 16 characters), else nil."
+  []
+  (let [t (some-> ((var-get #'*dev-token*)) str/trim)]
+    (when (and t (>= (count t) 16)) t)))
+
+(defn- loopback-addr? [addr]
+  (let [a (some-> addr str (str/replace #"^\[|\]$" ""))]
+    (boolean (and a (or (str/starts-with? a "127.") (= a "::1") (= a "0:0:0:0:0:0:0:1"))))))
+
+(defn dev-request?
+  "True when a dev token is configured and the request comes from this machine. The dev
+   token is only ever accepted, or handed to the console, under this condition."
+  [req]
+  (boolean (and (dev-token) (loopback-addr? (:remote-addr req)))))
+
+(defn compile-auth
+  "`endpoint-scopes`: every scope the loaded endpoints require; the dev caller gets them all."
+  ([cfg] (compile-auth cfg #{}))
+  ([{:keys [api-keys admin-scope] jwt-cfgs :jwt} endpoint-scopes]
+   (let [admin (or admin-scope "spindle:admin")]
+     {:keys (mapv (fn [{:keys [id sha256 scopes]}] {:id id :sha256 (str/lower-case (str sha256)) :scopes (set scopes)}) api-keys)
+      :issuers (jwt/compile-issuers jwt-cfgs)
+      :admin-scope admin
+      :dev-scopes (into #{admin "spindle:author" "spindle:trace"} endpoint-scopes)})))
 
 (defn- presented-key [req]
   (let [h (get-in req [:headers "authorization"])]
@@ -72,12 +101,18 @@
   ([auth req] (authenticate auth nil req))
   ([auth store req]
    (when-let [k (presented-key req)]
-     (if (and (seq (:issuers auth)) (jwt/jwt-shaped? k))
+     (cond
+       ;; development token: only from this machine, only when SPINDLE_DEV_TOKEN is set
+       (and (dev-request? req) (constant-time= (sha256-hex k) (sha256-hex (dev-token))))
+       {:client "dev" :id "dev" :scopes (:dev-scopes auth #{})}
+
+       (and (seq (:issuers auth)) (jwt/jwt-shaped? k))
        (when-let [caller (jwt/verify (:issuers auth) k)]
          ;; the token's subject is the end user; delegation headers still need spindle:delegate
          (if (or (get-in req [:headers "x-spindle-user"]) (get-in req [:headers "x-spindle-user-claims"]))
            (merge caller (end-user req caller))
            caller))
+       :else
      (let [h (sha256-hex k)
            entry (or (some #(when (constant-time= (:sha256 %) h) %) (:keys auth))
                      (when (and store (str/starts-with? k "spk_"))

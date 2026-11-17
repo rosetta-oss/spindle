@@ -373,6 +373,12 @@
           ;; home: the console is the front page
           (and (= uri "/") (= :get (:request-method req))) {:status 302 :headers {"Location" "/console"} :body ""}
 
+          ;; development only: hands the dev token to a console on this machine (404 otherwise)
+          (= uri "/console/dev-token")
+          (if (and (= :get (:request-method req)) (auth/dev-request? req))
+            (json-resp 200 {:token (auth/dev-token)})
+            (json-resp 404 {:error {:code "not_found" :message "no dev token"}}))
+
           (or (= uri "/console") (str/starts-with? uri "/console/"))
           (if (web/secure? req) (console-resp uri) (web/insecure-resp))
 

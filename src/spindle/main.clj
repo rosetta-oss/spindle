@@ -6,7 +6,10 @@
      SPINDLE_PORT         HTTP port (default 8080)
      SPINDLE_NODE_ID      node name in /status (default hostname)
      SPINDLE_POLL_MS      config poll interval (default 5000)
-     SPINDLE_DB           token store (default data/spindle.db; not inside the config dir)"
+     SPINDLE_DB           token store (default data/spindle.db; not inside the config dir)
+     SPINDLE_DEV_TOKEN    development only (16+ characters): a token accepted from this machine
+                          only, with the admin and author scopes and every endpoint scope; the
+                          console offers a one-click Dev login. Never set it on a shared server."
   (:require [clojure.tools.logging :as log]
             [spindle.config :as config]
             [spindle.server :as server]

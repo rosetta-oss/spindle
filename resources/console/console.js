@@ -456,6 +456,20 @@
     $('login-token').value = '';
     enter();
   });
+  // Development: when the server has SPINDLE_DEV_TOKEN and this page is on the same machine,
+  // /console/dev-token hands it over; one click logs in and Try it calls with it too.
+  function checkDev() {
+    fetch('/console/dev-token').then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (b) { state.devToken = (b && b.token) || ''; $('dev-login').hidden = !state.devToken; })
+      .catch(function () { $('dev-login').hidden = true; });
+  }
+  $('dev-login').addEventListener('click', function () {
+    if (!state.devToken) return;
+    setToken(state.devToken);
+    state.callToken = state.devToken;
+    enter();
+  });
+  checkDev();
   $('logout-btn').addEventListener('click', function () { logout(''); });
   $('reload-btn').addEventListener('click', function () {
     api('POST', '/admin/reload').then(function (r) {
