@@ -6,6 +6,7 @@
             [jsonista.core :as json]
             [reitit.core :as r]
             [ring.adapter.jetty9 :as jetty]
+            [spindle.activity :as activity]
             [spindle.auth :as auth]
             [spindle.cache :as cache]
             [spindle.config :as config]
@@ -69,8 +70,9 @@
                [(java.net.URLDecoder/decode ^String k "UTF-8") (java.net.URLDecoder/decode (str v) "UTF-8")]))
     {}))
 
-(defn- run-endpoint [snap store ep match req request-id]
+(defn- run-endpoint [snap store ep match req request-id who]
   (let [caller (auth/authenticate (:auth snap) store req)]
+    (vreset! who (:id caller))
     (when-not caller (err/fail! :unauthenticated "missing or invalid API key"))
     (when-not (auth/allowed? caller (:scopes ep)) (err/fail! :forbidden "missing scope"))
     (when (and (= :required (:caller ep)) (not (:sub caller)))
@@ -238,7 +240,7 @@
           (or (= uri "/console") (str/starts-with? uri "/console/"))
           (if (web/secure? req) (console-resp uri) (web/insecure-resp))
 
-          (and (str/starts-with? uri "/admin/tokens") (not (web/secure? req))) (web/insecure-resp)
+          (and (or (str/starts-with? uri "/admin/tokens") (= uri "/admin/activity")) (not (web/secure? req))) (web/insecure-resp)
 
           (or (= uri "/mcp") (str/starts-with? uri "/mcp/"))
           (if (web/secure? req)
@@ -254,6 +256,7 @@
               [:post "/admin/config/rollback"]
               (let [v (get (query-string-params req) "to")
                     r (config/with-write-lock (config/rollback! v))] (json-resp (if (:ok r) 200 422) r))
+              [:get "/admin/activity"] (json-resp 200 (activity/snapshot))
               [:post "/admin/config/unpin"] (do (config/unpin!) (json-resp 200 {:pinned false}))
               [:post "/admin/cache/evict"]
               (let [tags (remove str/blank? (str/split (str (get (query-string-params req) "tag")) #","))]
@@ -265,16 +268,19 @@
             (let [ep (get-in match [:data :spindle.config/endpoint])]
               (if (not= (:request-method req) (:method ep))
                 (json-resp 405 {:error {:code "method_not_allowed"}})
-                (let [^java.util.concurrent.atomic.AtomicLong inflight (:inflight snap)]
+                (let [^java.util.concurrent.atomic.AtomicLong inflight (:inflight snap)
+                      who (volatile! nil)]
                   (.incrementAndGet inflight)
                   (try
-                    (let [{:keys [body]} (run-endpoint snap store ep match req request-id)]
+                    (let [{:keys [body]} (run-endpoint snap store ep match req request-id who)]
                       (metrics/timer! "spindle_request_seconds" {:endpoint (:id ep) :outcome "ok"} (- (System/nanoTime) t0))
+                      (activity/record! {:endpoint (:id ep) :ms (/ (- (System/nanoTime) t0) 1e6) :caller @who :request-id request-id})
                       (json-resp 200 body))
                     (catch Throwable e
                       (let [code (or (:spindle/code (err/code-of e)) :internal)]
                         (metrics/timer! "spindle_request_seconds" {:endpoint (:id ep) :outcome "error"} (- (System/nanoTime) t0))
-                        (metrics/counter! "spindle_request_errors_total" {:endpoint (:id ep) :code (name code)}))
+                        (metrics/counter! "spindle_request_errors_total" {:endpoint (:id ep) :code (name code)})
+                        (activity/record! {:endpoint (:id ep) :ms (/ (- (System/nanoTime) t0) 1e6) :code code :caller @who :request-id request-id}))
                       (error-resp e request-id))
                     (finally (.decrementAndGet inflight))))))
             (json-resp 404 {:error {:code "not_found" :message "no such endpoint"}})))

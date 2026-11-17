@@ -1,8 +1,11 @@
 'use strict';
 (function () {
   var TOKEN_KEY = 'spindle.token';
-  var TABS = ['Overview', 'Connections', 'Endpoints', 'Caches', 'Config', 'Tokens'];
-  var state = { tab: 'Overview', status: null, tokens: null, showRevoked: false, timer: null };
+  var TABS = ['Overview', 'Activity', 'Connections', 'Endpoints', 'Caches', 'Config', 'Tokens'];
+  var state = { tab: 'Overview', status: null, tokens: null, showRevoked: false, timer: null,
+                activity: null, window: 'last_5m', expanded: {} };
+  // Activity thresholds: rows above them are flagged
+  var MAX_ERROR_RATE = 0.05, MAX_P95_MS = 5000;
 
   function $(id) { return document.getElementById(id); }
   function getToken() { try { return sessionStorage.getItem(TOKEN_KEY); } catch (e) { return null; } }
@@ -78,12 +81,19 @@
       else $('banner').textContent = 'Status failed: ' + errMsg(r);
     });
     if (state.tab === 'Tokens') p = p.then(loadTokens);
+    if (state.tab === 'Activity') p = p.then(loadActivity);
     return p.then(render).catch(fail);
   }
   function loadTokens() {
     return api('GET', '/admin/tokens').then(function (r) {
       if (r.ok) state.tokens = r.body;
       else if (r.status === 404) state.tokens = { tokens: [], config_keys: [], disabled: true };
+    });
+  }
+  function loadActivity() {
+    return api('GET', '/admin/activity').then(function (r) {
+      if (r.ok) state.activity = r.body;
+      else $('banner').textContent = 'Activity failed: ' + errMsg(r);
     });
   }
   function startPolling() {
@@ -123,7 +133,7 @@
     var view = $('view');
     view.textContent = '';
     var c = el('div', { id: 'controls' });
-    var builder = { Caches: cacheControls, Tokens: tokenControls }[state.tab];
+    var builder = { Activity: activityControls, Caches: cacheControls, Tokens: tokenControls }[state.tab];
     if (builder) builder(c);
     view.appendChild(c);
     view.appendChild(el('div', { id: 'data' }));
@@ -132,7 +142,7 @@
   function renderData(s) {
     var d = $('data');
     d.textContent = '';
-    var f = { Overview: overview, Connections: connections, Endpoints: endpoints, Caches: caches, Config: configTab, Tokens: tokensTab }[state.tab];
+    var f = { Overview: overview, Activity: activityTab, Connections: connections, Endpoints: endpoints, Caches: caches, Config: configTab, Tokens: tokensTab }[state.tab];
     d.appendChild(f(s));
   }
 
@@ -225,6 +235,52 @@
   function problemsText(p) {
     if (!p || !p.length) return 'none';
     return p.map(function (x) { return typeof x === 'string' ? x : JSON.stringify(x); }).join('\n');
+  }
+
+  // ---- activity ----
+  function ms(v) { return v == null ? '—' : (v >= 1000 ? (v / 1000).toFixed(2) + ' s' : Math.round(v) + ' ms'); }
+  function pct(v) { return v == null ? '—' : (v * 100).toFixed(1) + '%'; }
+  function activityControls(c) {
+    var wins = [['last_5m', 'Last 5 minutes'], ['since_start', 'Since start']];
+    var bar = el('div', { class: 'inline' });
+    wins.forEach(function (w) {
+      bar.appendChild(el('button', { class: state.window === w[0] ? 'active' : '', text: w[1], onclick: function () {
+        state.window = w[0];
+        Array.prototype.forEach.call(bar.children, function (b, i) { b.className = wins[i][0] === state.window ? 'active' : ''; });
+        renderData(state.status);
+      } }));
+    });
+    c.appendChild(bar);
+  }
+  function activityTab() {
+    var wrap = el('div'), a = state.activity;
+    if (!a) { wrap.appendChild(el('p', { class: 'muted', text: 'Loading…' })); return wrap; }
+    var rows = a[state.window] || [];
+    wrap.appendChild(el('p', { class: 'muted', text: (state.window === 'last_5m' ? 'Last ' + a.window_minutes + ' minutes' : 'Since ' + fmtTime(a.started_at)) +
+      ' · flagged: error rate > ' + pct(MAX_ERROR_RATE) + ' or p95 > ' + ms(MAX_P95_MS) + ' · click an API for its error codes' }));
+    var out = [];
+    rows.forEach(function (r) {
+      var badRate = r.error_rate > MAX_ERROR_RATE, badP95 = r.p95_ms != null && r.p95_ms > MAX_P95_MS;
+      var name = el('button', { class: 'link', text: (state.expanded[r.endpoint] ? '▾ ' : '▸ ') + r.endpoint, onclick: function () {
+        state.expanded[r.endpoint] = !state.expanded[r.endpoint]; renderData(state.status);
+      } });
+      out.push({ cls: badRate || badP95 ? 'flagged' : '', cells: [name, r.count, r.errors,
+        badRate ? badge(pct(r.error_rate), 'bad') : pct(r.error_rate), ms(r.avg_ms),
+        badP95 ? badge(ms(r.p95_ms), 'bad') : ms(r.p95_ms), ms(r.max_ms)] });
+      if (state.expanded[r.endpoint]) {
+        var codes = Object.keys(r.codes || {});
+        out.push({ cls: 'detail', cells: ['', codes.length ? codes.map(function (k) { return k + ': ' + r.codes[k]; }).join(', ') : 'no errors', '', '', '', '', ''] });
+      }
+    });
+    wrap.appendChild(rows.length ? table(['API', 'Calls', 'Errors', 'Error rate', 'Avg', 'p95', 'Max'], out)
+      : el('p', { class: 'muted', text: 'No API calls in this period.' }));
+    var errs = a.recent_errors || [];
+    wrap.appendChild(section('Recent errors (last ' + errs.length + ', newest first)', errs.length
+      ? table(['Time', 'API', 'Code', 'Duration', 'Caller', 'request_id'], errs.map(function (e) {
+          return { cells: [fmtTime(e.at), e.endpoint, badge(e.code, 'bad'), ms(e.ms), e.caller, el('code', { text: dash(e.request_id) })] };
+        }))
+      : el('p', { class: 'muted', text: 'No errors since start.' })));
+    return wrap;
   }
 
   function scopeList(scopes) { return (scopes || []).join(', '); }

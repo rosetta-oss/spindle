@@ -30,3 +30,8 @@ fieldset { border:1px solid var(--line); margin:.6rem 0; }
 fieldset label { display:block; }
 code#secret-value { display:block; word-break:break-all; padding:.6rem; background:var(--bg); border:1px solid var(--line); margin:.6rem 0; }
 .inline { display:inline-flex; gap:.4rem; align-items:center; margin:.5rem 0; }
+/* activity */
+#controls .inline button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+button.link { background:none; border:0; padding:0; color:var(--accent); cursor:pointer; font:inherit; text-align:left; }
+tr.flagged td { background:#fff4f3; }
+tr.detail td { color:var(--muted); font-size:12px; }
