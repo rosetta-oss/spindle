@@ -1,7 +1,9 @@
 (ns spindle.mcp
   "Authoring MCP: schema and flow introspection for agents. Streamable HTTP only
    (the legacy HTTP+SSE routes need :sse-writer and are not wired here)."
-  (:require [clojure.tools.logging :as log]
+  (:require [clojure.string :as str]
+            [clojure.tools.logging :as log]
+            [clojure.walk]
             [shuttle.http :as shttp]
             [shuttle.tools :as tools]
             [spindle.auth :as auth]
@@ -18,6 +20,21 @@
 (defn valid-flow-id? [s]
   (boolean (and (string? s) (<= (count s) 128)
                 (re-matches #"[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*" s))))
+
+(defn json-safe
+  "Tool results go through shuttle's JSON encoder, which knows no java.time:
+   dates and times become their ISO-8601 strings (as Spindle's endpoints send them)."
+  [x]
+  (clojure.walk/postwalk
+   #(if (or (instance? java.time.temporal.TemporalAccessor %) (instance? java.util.UUID %)) (str %) %)
+   x))
+
+(defn- db-message
+  "The database's own message from the first SQLException in the cause chain, or nil.
+   Authors need it to fix their SQL; API callers never see it (endpoints stay generic)."
+  [^Throwable t]
+  (some #(when (instance? java.sql.SQLException %) (some-> (.getMessage ^Throwable %) str/trim not-empty))
+        (take-while some? (iterate #(.getCause ^Throwable %) t))))
 
 (defn- sql-conn
   "→ [rt nil] or [nil {:error ..}]"
@@ -93,11 +110,13 @@
   (fn [_ {:keys [id] :as args}]
     (if-not (valid-flow-id? id)
       {:error "invalid flow id"}
-      (try (f args)
+      (try (json-safe (f args))
            (catch Throwable t
              (when-not (instance? clojure.lang.ExceptionInfo t)
                (log/warn (str "event=mcp-tool-failed flow=" id " error=" (.getName (class t)))))
-             {:error (or (ex-message t) "failed")})))))
+             (let [msg (or (ex-message t) "failed")
+                   db (db-message t)]
+               (cond-> {:error msg} (and db (not= db msg)) (assoc :database_error db))))))))
 
 (def trial-tools
   [{:name "validate_flow"

@@ -98,3 +98,18 @@
       (is (thrown? clojure.lang.ExceptionInfo (call tool {:id id :edn flow-edn :sql flow-sql :params {:id [1]}}))
           (str tool " " id)))
     (is (= before (files-under (:root *env*))))))
+
+(deftest test-run-reports-the-database-error
+  ;; passes validation (the plan is fine) but fails when executed
+  (let [edn (pr-str {:steps [{:id :x :kind :sql :conn :shop :sql "select abs(-9223372036854775808) as x"}]})
+        e (try (call "test_run" {:id "scratch/overflow" :edn edn :params {}}) nil
+               (catch clojure.lang.ExceptionInfo e e))]
+    (is (some? e))
+    (is (str/includes? (str/lower-case (pr-str (ex-data e) (ex-message e))) "integer overflow")
+        "the driver's message reaches the author")))
+
+(deftest tool-results-encode-java-time
+  (is (= {:at "2026-11-13T18:31:37" :d "2026-11-13" :rows [{:t "12:30"}] :n 1}
+         (spindle.mcp/json-safe {:at (java.time.LocalDateTime/of 2026 11 13 18 31 37)
+                                 :d (java.time.LocalDate/of 2026 11 13)
+                                 :rows [{:t (java.time.LocalTime/of 12 30)}] :n 1}))))
