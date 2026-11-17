@@ -147,3 +147,26 @@ select count(*) as n from orders")
     (testing "the pool still has free connections"
       (let [r (call h :get "/shop/fast" {:key api-key})]
         (is (= 200 (:status r)) (pr-str (:json r)))))))
+
+(deftest open-breaker-half-opens-after-its-delay
+  ;; :shop's breaker opens after 3 failures in 5 calls and should let a trial call
+  ;; through after "1s". It used to stay open for good: the fast-fail check asked
+  ;; isOpen(), and Failsafe only moves OPEN -> HALF_OPEN inside tryAcquirePermit().
+  (write! *dir* "flows/shop/bad.edn"
+          (pr-str {:steps [{:id :bad :kind :sql :conn :shop}]
+                   :endpoint {:path "/shop/bad" :scopes #{"shop:read"}}}))
+  (write! *dir* "flows/shop/bad.sql" "-- :name bad\nselect id from orders where 1 = (select count(*) from orders)")
+  (spindle.explain/enabled?)
+  (is (:ok (config/reload! *dir*)))
+  (let [h (server/handler {:node-id "t" :config-dir *dir*})
+        rt (get-in (config/current) [:conns :shop])]
+    ;; trip the breaker by recording failures directly on its guards
+    (dotimes [_ 5] (.recordFailure ^dev.failsafe.CircuitBreaker (get-in rt [:guards :breaker])))
+    (testing "open: calls fail fast"
+      (let [r (call h :get "/shop/orders" {:qs "id=1" :key api-key})]
+        (is (= 503 (:status r)))
+        (is (= "circuit breaker open" (get-in r [:json :error :message])))))
+    (testing "after the 1 s delay a trial call goes through and succeeds"
+      (Thread/sleep 1300)
+      (let [r (call h :get "/shop/orders" {:qs "id=2" :key api-key})]
+        (is (= 200 (:status r)) (pr-str (:json r)))))))

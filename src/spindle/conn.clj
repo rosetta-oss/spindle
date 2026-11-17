@@ -96,7 +96,10 @@
   "Run (f) behind the connection's guards. `classify` maps an exception to a code."
   [{:keys [id guards state]} f]
   (let [{:keys [^CircuitBreaker breaker ^Semaphore bulkhead queue-wait-ms rate-limiter]} guards]
-    (when (.isOpen breaker)
+    ;; fail fast only while the open delay runs: once it has passed, fall through to
+    ;; tryAcquirePermit, which is where Failsafe moves OPEN -> HALF_OPEN. (Checking
+    ;; isOpen alone kept the breaker open for good.)
+    (when (and (.isOpen breaker) (pos? (.toMillis (.getRemainingDelay breaker))))
       (metrics/counter! "spindle_breaker_rejected_total" {:conn id})
       (err/fail! :unavailable "circuit breaker open" {:conn id :retry-after-s 5}))
     (when rate-limiter

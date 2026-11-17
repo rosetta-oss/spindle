@@ -201,7 +201,9 @@
 (defn- breaker-info [rt]
   (let [st (conn/breaker-state rt)]
     (cond-> {:state (name st)}
-      (= st :open) (assoc :half_open_due_after_ms (get-in rt [:guards :breaker-delay-ms])))))
+      ;; time left before the next call may go through as a half-open trial
+      (= st :open) (assoc :half_open_due_after_ms
+                          (.toMillis (.getRemainingDelay ^dev.failsafe.CircuitBreaker (get-in rt [:guards :breaker])))))))
 
 (defn status-body [node-id admin?]
   (let [snap (config/current)
