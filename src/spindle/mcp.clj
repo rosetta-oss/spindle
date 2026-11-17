@@ -51,9 +51,14 @@
 (defn- safe-defaults [d]
   (select-keys d default-keys))
 
-(defn- metadata [rt f]
+(defn- metadata
+  "The author gets a generic error (driver messages can carry hosts and users);
+   the class goes to the log so an operator can see why lookups fail."
+  [rt f]
   (try (conn/guarded rt f)
-       (catch Throwable _ {:error "metadata lookup failed"})))
+       (catch Throwable t
+         (log/warn (str "event=mcp-metadata-failed error=" (.getName (class t))))
+         {:error "metadata lookup failed"})))
 
 (defn- endpoint-of [snap fid]
   (some (fn [ep] (when (= fid (:flow ep))
@@ -152,39 +157,45 @@
 
 (defn publish!
   "Validate, write flows/<id>.edn (+ .sql; removed when sql is nil) atomically,
-   reload. On reload failure the previous files are restored exactly."
+   reload. On reload failure the previous files are restored exactly.
+   Validation (which explains every SQL step against the database) runs outside
+   the write lock so a slow database does not stall reloads and other publishes;
+   the reload inside the lock validates again against whatever is current then.
+   The pin is checked on both sides: early to refuse cheaply, inside to be sure."
   [config-dir caller id edn sql]
-  (config/with-write-lock
-    (if (:pinned @config/state)
-      {:error "node is pinned"}
-      (let [{ps :problems} (trial/validate id edn sql)]
-        (if ps
-          {:problems ps}
-          (let [flows (.normalize (.toAbsolutePath (.resolve (Path/of (str config-dir) (make-array String 0)) "flows")))
-                files (vec (for [[ext text] [[".edn" edn] [".sql" sql]]
-                                 :let [p (.normalize (.resolve flows (str id ext)))]]
-                             (do (when-not (.startsWith p flows) (throw (ex-info "invalid flow id" {})))
-                                 [p (some-> ^String text (.getBytes "UTF-8"))])))
-                before (mapv (fn [[p _]] [p (read-bytes p)]) files)
-                restore! (fn []
-                           (let [errs (reduce (fn [errs [p b]]
-                                                (try (write-atomic! p b) errs
-                                                     (catch Throwable t (conj errs t))))
-                                              [] before)]
-                             (when (seq errs)
-                               (log/warn (str "event=publish-restore-failed flow=" id " failures=" (count errs))))
-                             errs))]
-            (try (doseq [[p b] files] (write-atomic! p b))
-                 (catch Throwable t
-                   (doseq [e (restore!)] (.addSuppressed t e))
-                   (throw t)))
-            (let [r (try (config/reload! config-dir)
-                         (catch Throwable t {:problems [{:message (or (ex-message t) "reload failed")}]}))]
-              (if (:ok r)
-                (do (log/info (str "event=flow-published flow=" id " by=" (:id caller) " version=" (:ok r)))
-                    {:version (:ok r) :reload r})
-                (do (restore!)
-                    {:error "reload failed" :problems (:problems r)})))))))))
+  (if (:pinned @config/state)
+    {:error "node is pinned"}
+    (let [{ps :problems} (trial/validate id edn sql)]
+      (if ps
+        {:problems ps}
+        (config/with-write-lock
+          (if (:pinned @config/state)
+            {:error "node is pinned"}
+            (let [flows (.normalize (.toAbsolutePath (.resolve (Path/of (str config-dir) (make-array String 0)) "flows")))
+                  files (vec (for [[ext text] [[".edn" edn] [".sql" sql]]
+                                   :let [p (.normalize (.resolve flows (str id ext)))]]
+                               (do (when-not (.startsWith p flows) (throw (ex-info "invalid flow id" {})))
+                                   [p (some-> ^String text (.getBytes "UTF-8"))])))
+                  before (mapv (fn [[p _]] [p (read-bytes p)]) files)
+                  restore! (fn []
+                             (let [errs (reduce (fn [errs [p b]]
+                                                  (try (write-atomic! p b) errs
+                                                       (catch Throwable t (conj errs t))))
+                                                [] before)]
+                               (when (seq errs)
+                                 (log/warn (str "event=publish-restore-failed flow=" id " failures=" (count errs))))
+                               errs))]
+              (try (doseq [[p b] files] (write-atomic! p b))
+                   (catch Throwable t
+                     (doseq [e (restore!)] (.addSuppressed t e))
+                     (throw t)))
+              (let [r (try (config/reload! config-dir)
+                           (catch Throwable t {:problems [{:message (or (ex-message t) "reload failed")}]}))]
+                (if (:ok r)
+                  (do (log/info (str "event=flow-published flow=" id " by=" (:id caller) " version=" (:ok r)))
+                      {:version (:ok r) :reload r})
+                  (do (restore!)
+                      {:error "reload failed" :problems (:problems r)}))))))))))
 
 (defn- publish-tool [config-dir]
   {:name "publish"
@@ -201,17 +212,36 @@
 
 (def default-tools (into read-tools trial-tools))
 
+(def default-max-body-bytes
+  "One JSON-RPC message carries at most a flow's EDN and SQL; 1 MiB is far above
+   that and keeps a single caller from making the node buffer arbitrary bodies."
+  (* 1024 1024))
+
+(def default-rate
+  "[requests per-ms] per caller id. Generous for an agent's edit-validate-run
+   loop; a runaway client gets 429 instead of tying up connections."
+  [300 60000])
+
 (defn handler
-  "Ring handler for /mcp (nil for other paths). `publish` is offered when :config-dir is set."
-  [{:keys [store config-dir]} & [tools]]
-  (shttp/routes
-   (merge
-    (tools/deps (vec (or tools (cond-> default-tools config-dir (conj (publish-tool config-dir))))))
-    {:authenticate (fn [req]
-                     (let [snap (config/current)
-                           caller (try (auth/authenticate (:auth snap) store req) (catch Throwable _ nil))
-                           admin (get-in snap [:auth :admin-scope] "spindle:admin")]
-                       (when (and caller (some (:scopes caller) [author-scope admin]))
-                         {:id (str (:id caller)) :ctx caller})))
-     :server-info {:name "spindle" :version version}
-     :unauthorized-message "Send a Spindle author or admin token as a Bearer token."})))
+  "Ring handler for /mcp (nil for other paths). `publish` is offered when :config-dir is set.
+   opts :mcp-max-body-bytes and :mcp-rate override the limits above.
+   The legacy SSE routes answer 404: without an :sse-writer shuttle would
+   register a session and then fail."
+  [{:keys [store config-dir mcp-max-body-bytes mcp-rate]} & [tools]]
+  (let [[n per-ms] (or mcp-rate default-rate)
+        routes (shttp/routes
+                (merge
+                 (tools/deps (vec (or tools (cond-> default-tools config-dir (conj (publish-tool config-dir))))))
+                 {:authenticate (fn [req]
+                                  (let [snap (config/current)
+                                        caller (try (auth/authenticate (:auth snap) store req) (catch Throwable _ nil))
+                                        admin (get-in snap [:auth :admin-scope] "spindle:admin")]
+                                    (when (and caller (some (:scopes caller) [author-scope admin]))
+                                      {:id (str (:id caller)) :ctx caller})))
+                  :rate-limit? (shttp/rate-limiter n per-ms)
+                  :max-body-bytes (or mcp-max-body-bytes default-max-body-bytes)
+                  :server-info {:name "spindle" :version version}
+                  :unauthorized-message "Send a Spindle author or admin token as a Bearer token."}))]
+    (fn [req]
+      (when (= "/mcp" (:uri req))
+        (routes req)))))

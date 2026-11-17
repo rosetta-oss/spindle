@@ -46,7 +46,9 @@
         (if ps {:problems ps} (f s (get-in s [:flows id])))))))
 
 (defn validate [id edn sql]
-  (let [{ps :problems} (build-candidate (config/current) (candidate-tree (config/current) id edn sql))]
+  ;; one snapshot for both: a reload in between must not mix two trees
+  (let [snap (config/current)
+        {ps :problems} (build-candidate snap (candidate-tree snap id edn sql))]
     (if ps {:problems ps} {:ok true})))
 
 (defn test-run [id edn sql params]

@@ -258,6 +258,8 @@ SPINDLE_CONFIG_DIR=config bin/spindle                   # adds drivers/*.jar
   files if the reload fails. Publish, `POST /admin/reload`, rollback and the file watcher share one lock.
   Publish is refused (`node is pinned`) after a rollback; `POST /admin/config/unpin` first. Every publish is
   logged as `event=flow-published flow=<id> by=<token id> version=<v>`.
+  Limits: one request body at most 1 MiB (413), 300 requests per minute per token (429 with `Retry-After`).
+  Only Streamable HTTP is served; the legacy `/mcp/sse` transport answers 404.
 - **HTTPS:** `/console`, `/mcp` and `/admin/tokens*` refuse plain HTTP (403) unless the request comes from
   loopback or carries `X-Forwarded-Proto: https`. The header is **trusted by default**; deployments reachable
   without the proxy must set `SPINDLE_TRUST_FORWARDED_PROTO=false`, so clients cannot set that header themselves. Note that loopback is trusted:

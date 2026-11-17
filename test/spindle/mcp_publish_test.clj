@@ -7,6 +7,8 @@
             [shuttle.client :as mc]
             [spindle.config :as config]
             [spindle.explain]
+            [spindle.mcp :as mcp]
+            [spindle.mcp.trial :as trial]
             [spindle.server :as server]
             [spindle.stepcache :as stepcache]
             [spindle.tokens :as tokens]))
@@ -103,6 +105,26 @@
     (is (str/includes? (str r) "{\"error\":\"node is pinned\"}"))
     (is (= before (flow-bytes (:cfg *env*))))
     (is (= v1 (:version (config/current))))))
+
+(deftest validation-runs-outside-the-lock
+  ;; another thread can take the write lock while a publish is validating
+  (let [during (atom nil)
+        validate trial/validate]
+    (with-redefs [trial/validate (fn [& args]
+                                   (reset! during (deref (future (config/with-write-lock :got)) 2000 :blocked))
+                                   (apply validate args))]
+      (is (:version (mcp/publish! (str (:cfg *env*)) {:id "t"} "it/v" (flow-edn "/it/v") flow-sql))))
+    (is (= :got @during))))
+
+(deftest pin-rechecked-inside-the-lock
+  ;; a rollback that pins the node while the publish validates wins
+  (let [before (flow-bytes (:cfg *env*))
+        v (:version (config/current))]
+    (with-redefs [trial/validate (fn [& _] (swap! config/state assoc :pinned true) {:ok true})]
+      (is (= {:error "node is pinned"}
+             (mcp/publish! (str (:cfg *env*)) {:id "t"} "it/late" (flow-edn "/it/late") flow-sql))))
+    (is (= before (flow-bytes (:cfg *env*))))
+    (is (= v (:version (config/current))))))
 
 (deftest publish-and-reload-serialised
   (let [fs (doall (for [n ["p1" "p2" "p3"]]

@@ -34,6 +34,8 @@
       (jdbc/execute! {:jdbcUrl url} ["create table orders (id integer primary key, customer text not null, note text)"])
       (jdbc/execute! {:jdbcUrl url} ["create index orders_customer on orders(customer)"])
       (jdbc/execute! {:jdbcUrl url} ["insert into orders values (1,'Zebediah-Row-Value',null)"])
+      (jdbc/execute! {:jdbcUrl url} ["create table a_b (only_a_b integer)"])
+      (jdbc/execute! {:jdbcUrl url} ["create table axb (only_axb integer)"])
       (write! cfg "secret.txt" secret)
       (write! cfg "connections.edn"
               (pr-str {:shop {:type :sql :dialect :sqlite :jdbc-url url
@@ -51,7 +53,7 @@
               port (.getLocalPort ^org.eclipse.jetty.server.ServerConnector (first (.getConnectors ^org.eclipse.jetty.server.Server srv)))
               tok #(:token (tokens/issue! store {:id %1 :scopes %2 :created-by "test"}))]
           (try
-            (binding [*env* {:url (str "http://127.0.0.1:" port "/mcp")
+            (binding [*env* {:url (str "http://127.0.0.1:" port "/mcp") :store store
                              :author (tok "author" ["spindle:author"])
                              :admin (tok "root" ["ops:admin"])
                              :reader (tok "reader" ["sales:read"])}]
@@ -102,6 +104,12 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no such connection"
                           (call :author "describe_table" {:conn "zzz" :table "orders"})))))
 
+(deftest describe-table-name-is-not-a-like-pattern
+  ;; `_` is a LIKE wildcard in DatabaseMetaData: a_b must not also match axb
+  (is (= ["only_a_b"] (map :name (:columns (data (call :author "describe_table" {:conn "shop" :table "a_b"}))))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no such table"
+                        (call :author "describe_table" {:conn "shop" :table "a%"}))))
+
 (deftest describe-proc-refusals
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no such procedure"
                         (call :author "describe_proc" {:conn "shop" :proc "p"}))))
@@ -128,3 +136,34 @@
 (deftest safe-defaults-is-an-allow-list
   (is (= {:timeout "2s" :max-rows 1000}
          (#'mcp/safe-defaults {:timeout "2s" :max-rows 1000 :dsn "postgres://u:p@h/db" :whatever 1}))))
+
+(defn- http [method uri tok body]
+  (let [b (-> (java.net.http.HttpRequest/newBuilder (java.net.URI. (str (:url *env*) uri)))
+              (.header "Authorization" (str "Bearer " tok))
+              (.header "Content-Type" "application/json")
+              (.header "Accept" "application/json, text/event-stream"))
+        b (if (= method :post)
+            (.POST b (java.net.http.HttpRequest$BodyPublishers/ofString body))
+            (.GET b))]
+    (.statusCode (.send (java.net.http.HttpClient/newHttpClient) (.build b)
+                        (java.net.http.HttpResponse$BodyHandlers/ofString)))))
+
+(deftest oversized-body-refused
+  (let [big (str "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{\"pad\":\""
+                 (apply str (repeat (inc mcp/default-max-body-bytes) "x")) "\"}}")]
+    (is (= 413 (http :post "" (:author *env*) big)))
+    (is (= 200 (http :post "" (:author *env*) "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}")))))
+
+(deftest legacy-sse-routes-are-404
+  (is (= 404 (http :get "/sse" (:author *env*) nil)))
+  (is (= 404 (http :post "/messages?sessionId=x" (:author *env*) "{}"))))
+
+(deftest callers-are-rate-limited
+  (let [h (mcp/handler {:store (:store *env*) :mcp-rate [2 60000]})
+        ping (fn [tok] (:status (h {:request-method :post :uri "/mcp" :remote-addr "127.0.0.1"
+                                     :headers {"authorization" (str "Bearer " tok) "content-type" "application/json"
+                                               "accept" "application/json, text/event-stream"}
+                                     :body (java.io.ByteArrayInputStream.
+                                            (.getBytes "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}" "UTF-8"))})))]
+    (is (= [200 200 429] (mapv (fn [_] (ping (:author *env*))) (range 3))))
+    (is (= 200 (ping (:admin *env*))) "the limit is per caller")))

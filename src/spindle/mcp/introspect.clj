@@ -17,8 +17,19 @@
   [n]
   (distinct [n (str/upper-case n) (str/lower-case n)]))
 
+(defn- escape-pattern
+  "getColumns/getProcedureColumns take LIKE patterns: an unescaped `_` or `%`
+   in a name would match other tables (order_items also matches orderXitems)
+   and merge their columns. nil stays nil (no schema filter)."
+  [^DatabaseMetaData md s]
+  (when s
+    (let [esc (.getSearchStringEscape md)]
+      (if (str/blank? esc)
+        s
+        (apply str (map (fn [c] (if (or (#{\_ \%} c) (= esc (str c))) (str esc c) c)) s))))))
+
 (defn- table-columns [^DatabaseMetaData md schema t]
-  (rows (.getColumns md nil schema t "%")
+  (rows (.getColumns md nil (escape-pattern md schema) (escape-pattern md t) "%")
         (fn [^ResultSet r] {:name (.getString r "COLUMN_NAME")
                             :type (.getString r "TYPE_NAME")
                             :nullable (= DatabaseMetaData/columnNullable (.getInt r "NULLABLE"))
@@ -54,7 +65,7 @@
     (with-open [con (jdbc/get-connection ds)]
       (let [^DatabaseMetaData md (.getMetaData con)
             ps (some (fn [n]
-                       (let [r (rows (.getProcedureColumns md nil schema n "%")
+                       (let [r (rows (.getProcedureColumns md nil (escape-pattern md schema) (escape-pattern md n) "%")
                                      (fn [^ResultSet r] {:name (.getString r "COLUMN_NAME")
                                                          :type (.getString r "TYPE_NAME")
                                                          :mode (get proc-modes (.getInt r "COLUMN_TYPE") "unknown")}))]

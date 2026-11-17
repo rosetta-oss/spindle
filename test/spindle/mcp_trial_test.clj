@@ -95,7 +95,8 @@
   (let [before (files-under (:root *env*))]
     (doseq [id ["../x" "a\\b" "/abs" ""]
             tool ["validate_flow" "test_run" "explain"]]
-      (is (thrown? clojure.lang.ExceptionInfo (call tool {:id id :edn flow-edn :sql flow-sql :params {:id [1]}}))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"invalid flow id"
+                            (call tool {:id id :edn flow-edn :sql flow-sql :params {:id [1]}}))
           (str tool " " id)))
     (is (= before (files-under (:root *env*))))))
 
