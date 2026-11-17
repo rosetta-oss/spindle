@@ -12,6 +12,8 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [malli.core :as m]
+            [malli.error]
+            [malli.transform :as mt]
             [spindle.conn :as conn]
             [spindle.dialect]
             [spindle.error :as err]
@@ -187,6 +189,29 @@
               :endpoint (:endpoint raw)
               :doc (:doc raw)}})))
 
+(defn- split-lists
+  "Comma-separated strings for vector-typed params become vectors (Semalith's
+   batch placeholder sends `1,2,3`)."
+  [schema params]
+  (if-not schema
+    params
+    (let [entries (when (= :map (m/type schema)) (m/children schema))
+          list-keys (set (keep (fn [[k _ s]] (when (#{:vector :sequential :set} (m/type s)) k)) entries))]
+      (reduce (fn [p k]
+                (let [v (get p k)]
+                  (cond (string? v) (assoc p k (vec (remove str/blank? (map str/trim (str/split v #",")))))
+                        :else p)))
+              params list-keys))))
+
+(defn coerce-params
+  "Raw request params → params decoded and validated against the flow schema." [schema raw]
+  (let [raw (split-lists schema raw)
+        v (m/decode schema raw (mt/transformer mt/string-transformer mt/strip-extra-keys-transformer))]
+    (if (m/validate schema v)
+      v
+      (err/fail! :input_rejected (str "invalid parameters: "
+                                      (pr-str (malli.error/humanize (m/explain schema v))))))))
+
 ;; ---------------------------------------------------------------------------
 ;; running
 ;; ---------------------------------------------------------------------------
@@ -211,7 +236,7 @@
 (defn- cached
   "Run `compute` through the step cache when the step has :cache settings."
   [step flow-id env cache-payload compute]
-  (if-let [s (:step-cache step)]
+  (if-let [s (when-not (:no-cache? env) (:step-cache step))]
     (let [k [(:conn step) (:kind step) cache-payload
              (when (= :caller (:per s)) (stepcache/caller-scope (:caller env)))]]
       (:rows (stepcache/lookup k s [flow-id (name (:id step))] compute)))
@@ -241,13 +266,22 @@
                                 (- (System/nanoTime) t0))))))
 
 (defn execute
-  "Run a compiled flow. → {:rows .. :partial [...]}"
-  [snapshot flow params {:keys [caller request-id]}]
+  "Run a compiled flow. → {:rows .. :partial [...]}
+   :no-cache? bypasses the step cache (neither read nor filled);
+   :on-step (fn [step-id rows ms]) is called after each successful step."
+  [snapshot flow params {:keys [caller request-id no-cache? on-step]}]
   (let [deadline-ns (+ (System/nanoTime) (* 1000000 (:deadline-ms flow)))
-        env {:params params :caller caller :deadline-ns deadline-ns :parallel (:parallel flow)}
+        env (cond-> {:params params :caller caller :deadline-ns deadline-ns :parallel (:parallel flow)}
+              no-cache? (assoc :no-cache? true))
+        run1 (fn [step env cancels] (run-step snapshot (:id flow) request-id env step env cancels))
         {:keys [results partial]}
         (executor/run (:steps flow)
-                      (fn [step env cancels] (run-step snapshot (:id flow) request-id env step env cancels))
+                      (if on-step
+                        (fn [step env cancels]
+                          (let [t0 (System/nanoTime) rows (run1 step env cancels)]
+                            (on-step (:id step) rows (quot (- (System/nanoTime) t0) 1000000))
+                            rows))
+                        run1)
                       env)
         zone (some (fn [[_ s]] (get-in snapshot [:conns (:conn s) :cfg :zone])) (:steps flow))
         ;; shaping runs SCI expressions: bound by the remaining deadline

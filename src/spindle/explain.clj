@@ -24,7 +24,7 @@
 
 (defn archive-dir [] (or *archive-dir* (System/getenv "SPINDLE_EXPLAIN_DIR") "explain-archive"))
 
-(defn- example-values [step example]
+(defn example-values [step example]
   (into {}
         (for [{:keys [param list?]} (distinct (filter map? (:scanned step)))
               :let [path (get-in step [:in param])

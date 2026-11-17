@@ -1,0 +1,100 @@
+(ns spindle.mcp-trial-test
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [clojure.test :refer [deftest is use-fixtures]]
+            [jsonista.core :as json]
+            [next.jdbc :as jdbc]
+            [shuttle.client :as mc]
+            [spindle.config :as config]
+            [spindle.explain]
+            [spindle.server :as server]
+            [spindle.stepcache :as stepcache]
+            [spindle.tokens :as tokens]))
+
+(def ^:dynamic *env* nil)
+
+(defn- write! [dir rel text]
+  (let [f (io/file dir rel)] (io/make-parents f) (spit f text)))
+
+(def ^:private flow-edn
+  (pr-str {:params '[:map [:id [:vector {:min 1} pos-int?]]]
+           :examples [{:id [1]}]
+           :steps [{:id :orders :kind :sql :conn :shop :in {:id [:params :id]} :cache {:ttl "30s"}}]
+           :output {:from :orders}
+           :endpoint {:path "/shop/orders" :scopes #{"sales:read"}}}))
+(def ^:private flow-sql "-- :name orders\nselect id, customer from orders where id in :id")
+
+(defn- files-under [d]
+  (set (map str (filter #(.isFile ^java.io.File %) (file-seq (io/file d))))))
+
+(use-fixtures :each
+  (fn [t]
+    (let [root (doto (io/file (System/getProperty "java.io.tmpdir") (str "spindle-trial-test-" (System/nanoTime))) (.mkdirs))
+          cfg (io/file root "config")
+          url (str "jdbc:sqlite:" (io/file root "shop.db"))]
+      (jdbc/execute! {:jdbcUrl url} ["create table orders (id integer primary key, customer text not null)"])
+      (jdbc/execute! {:jdbcUrl url} ["insert into orders values (1,'a'),(2,'b')"])
+      (write! cfg "connections.edn"
+              (pr-str {:shop {:type :sql :dialect :sqlite :jdbc-url url
+                              :pool {:max 2} :defaults {:timeout "2s" :max-rows 1000}}}))
+      (write! cfg "auth.edn" (pr-str {:api-keys [] :admin-scope "ops:admin"}))
+      (write! cfg "flows/shop/orders.edn" flow-edn)
+      (write! cfg "flows/shop/orders.sql" flow-sql)
+      (reset! config/state {:snapshot nil :history [] :last-reload nil :pinned false})
+      (stepcache/clear!)
+      (binding [spindle.explain/*archive-dir* (str (io/file root "explain"))]
+        (is (:ok (config/reload! (str cfg)))))
+      (let [store (tokens/open-sqlite (str (io/file root "tokens.db")) (str cfg) {})
+            srv (server/start! {:port 0 :node-id "t" :config-dir (str cfg) :store store})
+            port (.getLocalPort ^org.eclipse.jetty.server.ServerConnector (first (.getConnectors ^org.eclipse.jetty.server.Server srv)))]
+        (try
+          (binding [*env* {:url (str "http://127.0.0.1:" port "/mcp") :root root :cfg cfg
+                           :author (:token (tokens/issue! store {:id "author" :scopes ["spindle:author"] :created-by "test"}))}]
+            (t))
+          (finally (.stop ^org.eclipse.jetty.server.Server srv)))))))
+
+(defn- call [tool args]
+  (let [c (mc/connect {:url (:url *env*) :bearer (:author *env*)})]
+    (try (mc/call-tool c tool args) (finally (mc/close c)))))
+
+(defn- data [r] (json/read-value (mc/text r) (json/object-mapper {:decode-key-fn true})))
+
+(deftest validate-ok-and-problems
+  (let [v (:version (config/current))]
+    (is (= {:ok true} (data (call "validate_flow" {:id "shop/orders2" :edn (str/replace flow-edn "/shop/orders" "/shop/o2") :sql flow-sql}))))
+    (let [r (data (call "validate_flow" {:id "shop/bad" :edn (str/replace flow-edn "/shop/orders" "/shop/bad")
+                                         :sql "-- :name orders\nselect * from nosuch where id in :id"}))]
+      (is (seq (:problems r)))
+      (is (str/includes? (pr-str (:problems r)) "orders")))
+    (is (= v (:version (config/current))))))
+
+(deftest test-run-does-not-touch-cache
+  (let [arch (files-under (io/file "explain-archive"))
+        before (stepcache/stats)
+        v (:version (config/current))
+        r (data (call "test_run" {:id "shop/orders" :params {:id [1 2]}}))
+        r2 (data (call "test_run" {:id "shop/orders" :edn flow-edn :sql flow-sql :params {:id "1"}}))]
+    (is (= [{:id 1 :customer "a"} {:id 2 :customer "b"}] (:output r)))
+    (is (= [{:id 1 :customer "a"}] (:output r2)))
+    (is (= "orders" (:id (first (:steps r)))))
+    (is (= 2 (:rows (first (:steps r)))))
+    (is (number? (:ms (first (:steps r)))))
+    (is (= [] (:partial r)))
+    (is (= before (stepcache/stats)))
+    (is (= arch (files-under (io/file "explain-archive"))))
+    (is (= v (:version (config/current))))))
+
+(deftest explain-sqlite
+  (let [r (data (call "explain" {:id "shop/orders"}))
+        r2 (data (call "explain" {:id "shop/orders" :edn flow-edn :sql flow-sql :params {:id [2]}}))]
+    (is (= "orders" (:id (first (:steps r)))))
+    (is (seq (:plan (first (:steps r)))))
+    (is (seq (:plan (first (:steps r2)))))))
+
+(deftest flow-id-rejects-traversal
+  (let [before (files-under (:root *env*))]
+    (doseq [id ["../x" "a\b" "/abs" ""]
+            tool ["validate_flow" "test_run" "explain"]]
+      (is (thrown? clojure.lang.ExceptionInfo (call tool {:id id :edn flow-edn :sql flow-sql :params {:id [1]}}))
+          (str tool " " id)))
+    (is (= before (files-under (:root *env*))))))

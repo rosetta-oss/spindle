@@ -6,7 +6,8 @@
             [spindle.auth :as auth]
             [spindle.config :as config]
             [spindle.conn :as conn]
-            [spindle.mcp.introspect :as introspect]))
+            [spindle.mcp.introspect :as introspect]
+            [spindle.mcp.trial :as trial]))
 
 (def author-scope "spindle:author")
 (def version "0.1.0")
@@ -81,12 +82,38 @@
                    {:id id :version (get-in snap [:flows id :version])
                     :edn edn :sql (get (:tree snap) (str "flows/" id ".sql"))})))}])
 
+(defn- trial-tool [f]
+  (fn [_ {:keys [id] :as args}]
+    (if-not (valid-flow-id? id)
+      {:error "invalid flow id"}
+      (try (f args)
+           (catch Throwable t {:error (or (ex-message t) "failed")})))))
+
+(def trial-tools
+  [{:name "validate_flow"
+    :description "Validate a flow (EDN + optional SQL) together with the running config, as a reload would, without installing it."
+    :input [:map [:id :string] [:edn :string] [:sql {:optional true} :string]]
+    :annotations {:readOnlyHint true}
+    :handler (trial-tool (fn [{:keys [id edn sql]}] (trial/validate id edn sql)))}
+   {:name "test_run"
+    :description "Run a flow once (the given EDN/SQL, or the published flow) without step caches. Returns output, per-step rows and ms, and partial steps."
+    :input [:map [:id :string] [:edn {:optional true} :string] [:sql {:optional true} :string] [:params {:optional true} :map]]
+    :annotations {:readOnlyHint true}
+    :handler (trial-tool (fn [{:keys [id edn sql params]}] (trial/test-run id edn sql (or params {}))))}
+   {:name "explain"
+    :description "Query plan of each SQL step via the dialect (params, or the flow's first example)."
+    :input [:map [:id :string] [:edn {:optional true} :string] [:sql {:optional true} :string] [:params {:optional true} :map]]
+    :annotations {:readOnlyHint true}
+    :handler (trial-tool (fn [{:keys [id edn sql params]}] (trial/explain id edn sql params)))}])
+
+(def default-tools (into read-tools trial-tools))
+
 (defn handler
-  "Ring handler for /mcp (nil for other paths). Tasks 6-7 extend `tools`."
+  "Ring handler for /mcp (nil for other paths). Task 7 extends `tools`."
   [{:keys [store]} & [tools]]
   (shttp/routes
    (merge
-    (tools/deps (vec (or tools read-tools)))
+    (tools/deps (vec (or tools default-tools)))
     {:authenticate (fn [req]
                      (let [snap (config/current)
                            caller (try (auth/authenticate (:auth snap) store req) (catch Throwable _ nil))

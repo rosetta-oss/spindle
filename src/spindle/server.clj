@@ -4,8 +4,6 @@
             [clojure.string :as str]
             [clojure.tools.logging :as log]
             [jsonista.core :as json]
-            [malli.core :as m]
-            [malli.transform :as mt]
             [reitit.core :as r]
             [ring.adapter.jetty9 :as jetty]
             [spindle.auth :as auth]
@@ -54,33 +52,11 @@
 ;; parameters
 ;; ---------------------------------------------------------------------------
 
-(defn- split-lists
-  "Comma-separated strings for vector-typed params become vectors (Semalith's
-   batch placeholder sends `1,2,3`)."
-  [schema params]
-  (if-not schema
-    params
-    (let [entries (when (= :map (m/type schema)) (m/children schema))
-          list-keys (set (keep (fn [[k _ s]] (when (#{:vector :sequential :set} (m/type s)) k)) entries))]
-      (reduce (fn [p k]
-                (let [v (get p k)]
-                  (cond (string? v) (assoc p k (vec (remove str/blank? (map str/trim (str/split v #",")))))
-                        :else p)))
-              params list-keys))))
-
 (defn- request-params [req match]
   (let [qp (into {} (map (fn [[k v]] [(keyword k) v])) (:query-params req))
         body (when (and (:body req) (#{:post} (:request-method req)))
                (let [s (slurp (:body req))] (when-not (str/blank? s) (json/read-value s read-mapper))))]
     (merge qp (when (map? body) body) (:path-params match))))
-
-(defn- coerce-params [schema raw]
-  (let [raw (split-lists schema raw)
-        v (m/decode schema raw (mt/transformer mt/string-transformer mt/strip-extra-keys-transformer))]
-    (if (m/validate schema v)
-      v
-      (err/fail! :input_rejected (str "invalid parameters: "
-                                      (pr-str (malli.error/humanize (m/explain schema v))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; endpoint handler
@@ -100,7 +76,7 @@
     (when (and (= :required (:caller ep)) (not (:sub caller)))
       (err/fail! :unauthenticated "this endpoint needs the end user (X-Spindle-User)"))
     (let [fl (get-in snap [:flows (:flow ep)])
-          params (coerce-params (:params-schema fl) (request-params (assoc req :query-params (query-string-params req)) match))
+          params (flow/coerce-params (:params-schema fl) (request-params (assoc req :query-params (query-string-params req)) match))
           compute #(flow/execute snap fl params {:caller caller :request-id request-id})
           c (get-in snap [:caches (:id ep)])
           {:keys [value] cache-state :cache} (if c
