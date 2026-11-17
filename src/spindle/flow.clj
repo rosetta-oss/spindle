@@ -11,6 +11,8 @@
    Step kinds: :sql, :api (alias :http). Conditions: :when (declarative)."
   (:require [clojure.set :as set]
             [clojure.string :as str]
+            [clojure.tools.logging]
+            [jsonista.core]
             [malli.core :as m]
             [malli.error]
             [malli.transform :as mt]
@@ -178,6 +180,24 @@
     (when (> (count steps-raw) max-steps) (add! [:steps] (str "more than " max-steps " steps")))
     (when (cycle? deps) (add! [:steps] "the step graph has a cycle"))
     (when (> deadline-ms max-deadline-ms) (add! [:limits :timeout] (str "deadline above " max-deadline-ms " ms")))
+    ;; batch: the key is a list parameter; rows must be regroupable by it
+    (when-let [{bk :key} (get-in raw [:endpoint :batch])]
+      (let [entries (when (and params-schema (= :map (m/type params-schema))) (m/children params-schema))
+            ks (some (fn [[k _ sch]] (when (= k bk) sch)) entries)]
+        (when-not (and ks (#{:vector :sequential :set} (m/type ks)))
+          (add! [:endpoint :batch :key] (str "batch key " bk " must be a list parameter in :params, e.g. [" bk " [:vector {:max 500} pos-int?]]")))
+        (when (get-in raw [:output :one?]) (add! [:endpoint :batch] "a batch endpoint returns rows; drop :one? from :output"))))
+    ;; keyset paging: rows (never :one?), size within the row cap, and a step that binds [:page :limit]
+    (when-let [{:keys [size max-size] :or {size 50 max-size 500}} (get-in raw [:endpoint :page])]
+      (let [root (get compiled (:from out-spec))
+            uses-limit? (some (fn [[_ st]] (some #(= [:page :limit] %) (vals (:in st)))) compiled)]
+        (when (get-in raw [:output :one?]) (add! [:endpoint :page] "a paged endpoint returns rows; drop :one? from :output"))
+        (when (get-in raw [:endpoint :batch]) (add! [:endpoint :page] "an endpoint is either paged or a batch, not both"))
+        (when (> size max-size) (add! [:endpoint :page :size] "size is above max-size"))
+        (when (and (:max-rows root) (> (inc max-size) (:max-rows root)))
+          (add! [:endpoint :page :max-size] (str "max-size + 1 must fit the root step's row cap (" (:max-rows root) ")")))
+        (when-not uses-limit?
+          (add! [:endpoint :page] "no step binds [:page :limit]; the root SQL must fetch size + 1 rows (e.g. limit :limit)"))))
     (if (seq @problems)
       {:problems @problems}
       {:flow {:id flow-id
@@ -226,8 +246,10 @@
               (if list?
                 (let [l (paths/as-list v)]
                   (if (empty? l) (reduced {:empty true}) (assoc-in acc [:values param] l)))
-                (let [{:keys [value empty]} (paths/as-scalar v param)]
-                  (if empty (reduced {:empty true}) (assoc-in acc [:values param] value))))))
+                (if (= :page (first (get in param)))
+                  (assoc-in acc [:values param] v)        ; keyset paging: nil on the first page is NULL, not "skip"
+                  (let [{:keys [value empty]} (paths/as-scalar v param)]
+                    (if empty (reduced {:empty true}) (assoc-in acc [:values param] value)))))))
           {:values {}}
           (distinct (filter map? scanned))))
 
@@ -254,19 +276,46 @@
 
 (declare run-step-kind)
 
+;; ---------------------------------------------------------------------------
+;; slow-query log: one JSON line per step over its threshold (logger spindle.slow)
+;;   threshold: step/connection :tuning :slow ("500ms"), else SPINDLE_SLOW_MS, else 1000 ms
+;; ---------------------------------------------------------------------------
+
+(def ^:private default-slow-ms
+  (delay (or (some-> (System/getenv "SPINDLE_SLOW_MS") parse-long) 1000)))
+
+(defn- params-hash [params]
+  (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") (.getBytes (pr-str (into (sorted-map) params)) "UTF-8"))]
+    (subs (apply str (map #(format "%02x" %) d)) 0 16)))
+
+(defn- slow-log! [flow-id step env ns outcome rows]
+  (let [limit-ms (conn/parse-duration-ms (get-in step [:tuning :slow]) @default-slow-ms)
+        ms (quot ns 1000000)]
+    (when (and (pos? limit-ms) (>= ms limit-ms))
+      (spindle.metrics/counter! "spindle_slow_steps_total" {:endpoint flow-id :step (name (:id step))})
+      (clojure.tools.logging/log "spindle.slow" :warn nil
+                                 (jsonista.core/write-value-as-string
+                                  {:event "slow-step" :endpoint flow-id :step (name (:id step)) :kind (name (:kind step))
+                                   :conn (name (:conn step)) :flow_version (:flow-version env) :ms ms :threshold_ms limit-ms
+                                   :rows rows :outcome outcome :params_hash (params-hash (:params env))
+                                   :request_id (:request-id env)})))))
+
 (defn- run-step [snapshot flow-id tag-id {:keys [deadline-ns]} step env cancels]
   (let [ctx {:deadline-ns deadline-ns :cancels cancels :tag (str flow-id "#" (name (:id step)) " " tag-id)}
         t0 (System/nanoTime)
-        outcome (volatile! "error")]
+        outcome (volatile! "error")
+        nrows (volatile! nil)]
     (try
       (if (and (:when step) (not (eval-cond (:when step) env)))
         (do (vreset! outcome "skipped")
             (:default step))                  ; skipped: a stable, declared value
         (let [v (run-step-kind snapshot flow-id step env ctx)]
           (vreset! outcome "ok")
+          (vreset! nrows (if (sequential? v) (count v) (if (nil? v) 0 1)))
           v))
       (finally
         (let [ns (- (System/nanoTime) t0)]
+          (slow-log! flow-id step env ns @outcome @nrows)
           (note! env step {:kind (name (:kind step)) :conn (name (:conn step)) :start t0 :ms (quot ns 1000000) :outcome @outcome})
           (spindle.metrics/timer! "spindle_step_seconds" {:endpoint flow-id :step (name (:id step)) :kind (name (:kind step))} ns))))))
 
@@ -292,10 +341,11 @@
    :no-cache? bypasses the step cache (neither read nor filled);
    :trace? collects, per step, kind, connection, ms, outcome and cache state;
    :on-step (fn [step-id rows ms]) is called after each successful step."
-  [snapshot flow params {:keys [caller request-id no-cache? on-step trace?]}]
+  [snapshot flow params {:keys [caller request-id no-cache? on-step trace? page]}]
   (let [deadline-ns (+ (System/nanoTime) (* 1000000 (:deadline-ms flow)))
         trace (when trace? (atom {}))
-        env (cond-> {:params params :caller caller :deadline-ns deadline-ns :parallel (:parallel flow)}
+        env (cond-> {:params params :caller caller :deadline-ns deadline-ns :parallel (:parallel flow)
+                     :page page :flow-version (:version flow) :request-id request-id}
               no-cache? (assoc :no-cache? true)
               trace (assoc :trace trace))
         run1 (fn [step env cancels] (run-step snapshot (:id flow) request-id env step env cancels))

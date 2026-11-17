@@ -79,6 +79,15 @@
               {:value (:value e) :cache :stale :stale-reason code}
               (throw t))))))))
 
+(defn peek-fresh
+  "The cached value under `k` when it is still fresh (within :ttl), else nil.
+   Used by the batch route, which checks the cache key by key."
+  [{:keys [^Cache cache settings]} k]
+  (when-let [e (.getIfPresent cache k)]
+    (when (< (- (now) (:at e)) (:ttl settings)) (:value e))))
+
+(defn put! [{:keys [^Cache cache]} k v] (.put cache k {:value v :at (now)}) v)
+
 (defn stats [{:keys [^Cache cache]}]
   (let [s (.stats cache)]
     {:entries (.estimatedSize cache) :hits (.hitCount s) :misses (.missCount s)}))

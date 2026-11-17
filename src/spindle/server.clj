@@ -14,6 +14,7 @@
             [spindle.error :as err]
             [spindle.flow :as flow]
             [spindle.mcp :as mcp]
+            [spindle.openapi :as openapi]
             [spindle.metrics :as metrics]
             [spindle.stepcache :as stepcache]
             [spindle.tokens :as tokens]
@@ -29,7 +30,11 @@
                OffsetDateTime (fn [v ^com.fasterxml.jackson.core.JsonGenerator g] (.writeString g (str v)))
                Instant (fn [v ^com.fasterxml.jackson.core.JsonGenerator g] (.writeString g (str v)))}}))
 
-(def ^:private read-mapper (json/object-mapper {:decode-key-fn true}))
+;; JSON integers read as Long, like query-string numbers: cache keys and key
+;; lookups then agree whichever way a parameter arrived.
+(def ^:private read-mapper
+  (doto (json/object-mapper {:decode-key-fn true})
+    (.configure com.fasterxml.jackson.databind.DeserializationFeature/USE_LONG_FOR_INTS true)))
 
 (defn- json-resp
   ([status body] (json-resp status body nil))
@@ -58,7 +63,7 @@
 
 (defn- request-params [req match]
   (let [qp (into {} (map (fn [[k v]] [(keyword k) v])) (:query-params req))
-        body (when (and (:body req) (#{:post} (:request-method req)))
+        body (when (and (:body req) (#{:post :put :patch :delete} (:request-method req)))
                (let [s (slurp (:body req))] (when-not (str/blank? s) (json/read-value s read-mapper))))]
     (merge qp (when (map? body) body) (:path-params match))))
 
@@ -75,37 +80,115 @@
 
 (def trace-scope "spindle:trace")
 
-(defn- run-endpoint [snap store ep match req request-id who]
+(defn- authorize! [snap store ep req who]
   (let [caller (auth/authenticate (:auth snap) store req)]
     (vreset! who (:id caller))
     (when-not caller (err/fail! :unauthenticated "missing or invalid API key"))
     (when-not (auth/allowed? caller (:scopes ep)) (err/fail! :forbidden "missing scope"))
     (when (and (= :required (:caller ep)) (not (:sub caller)))
       (err/fail! :unauthenticated "this endpoint needs the end user (X-Spindle-User)"))
-    (let [fl (get-in snap [:flows (:flow ep)])
-          raw (request-params (assoc req :query-params (query-string-params req)) match)
-          ;; ?trace=true: how each step ran, for callers holding spindle:trace (or admin)
-          trace? (and (= "true" (str (:trace raw)))
-                      (or (auth/allowed? caller #{trace-scope})
-                          (auth/allowed? caller #{(get-in snap [:auth :admin-scope] "spindle:admin")})))
-          params (flow/coerce-params (:params-schema fl) (dissoc raw :trace))
-          t0 (System/nanoTime)
-          compute #(flow/execute snap fl params {:caller caller :request-id request-id :trace? trace?})
-          c (when-not trace? (get-in snap [:caches (:id ep)]))
-          {:keys [value] cache-state :cache} (if c
-                                              ;; the endpoint cache is per caller whenever any step depends on the caller
-                                              (cache/lookup c [(:version fl) params
-                                                               (when (:caller-dependent? fl) (stepcache/caller-scope caller))]
-                                                            compute)
-                                              {:value (compute) :cache :none})]
-      (when (= cache-state :stale) (metrics/counter! "spindle_cache_stale_served_total" {:endpoint (:id ep)}))
-      {:body {:rows (:rows value)
-              :next nil
-              :meta (cond-> {:endpoint (:id ep) :config_version (:version snap) :flow_version (:version fl)
-                             :cache (name cache-state) :elapsed_ms (quot (- (System/nanoTime) t0) 1000000)
-                             :partial (mapv #(update (update % :step name) :code name) (:partial value))}
-                      (seq (:checks value)) (assoc :checks (mapv #(update % :result name) (:checks value)))
-                      (:trace value) (assoc :trace (:trace value)))}})))
+    caller))
+
+(defn- trace-allowed? [snap caller raw]
+  (and (= "true" (str (:trace raw)))
+       (or (auth/allowed? caller #{trace-scope})
+           (auth/allowed? caller #{(get-in snap [:auth :admin-scope] "spindle:admin")}))))
+
+(defn- cache-key [fl params caller page]
+  ;; the endpoint cache is per caller whenever any step depends on the caller
+  [(:version fl) params (when (:caller-dependent? fl) (stepcache/caller-scope caller)) page])
+
+(defn- meta-of [snap ep fl value cache-state t0]
+  (cond-> {:endpoint (:id ep) :config_version (:version snap) :flow_version (:version fl)
+           :cache (name cache-state) :elapsed_ms (quot (- (System/nanoTime) t0) 1000000)
+           :partial (mapv #(update (update % :step name) :code name) (:partial value))}
+    (seq (:checks value)) (assoc :checks (mapv #(update % :result name) (:checks value)))
+    (:trace value) (assoc :trace (:trace value))))
+
+;; --- keyset paging -----------------------------------------------------------
+;; endpoint :page {:key [:col ...] :size 50 :max-size 500}; request ?size=&after=<cursor>
+;; The root SQL binds [:page :limit] (size + 1) and [:page :after_<col>] (nil on page 1).
+
+(defn encode-cursor [m]
+  (.encodeToString (.withoutPadding (java.util.Base64/getUrlEncoder))
+                   (.getBytes (json/write-value-as-string m mapper) "UTF-8")))
+
+(defn- decode-cursor [^String s]
+  (try (let [m (json/read-value (String. (.decode (java.util.Base64/getUrlDecoder) (str/trim s)) "UTF-8") read-mapper)]
+         (if (map? m) m (throw (ex-info "not a map" {}))))
+       (catch Exception _ (err/fail! :input_rejected "invalid paging cursor"))))
+
+(defn- page-env [{:keys [key size max-size] :or {size 50 max-size 500}} raw]
+  (let [n (if-let [s (:size raw)]
+            (or (when-let [v (parse-long (str s))] (when (<= 1 v max-size) v))
+                (err/fail! :input_rejected (str "size must be 1.." max-size)))
+            size)
+        after (when-let [c (:after raw)] (when-not (str/blank? (str c)) (decode-cursor (str c))))]
+    (when (and after (not= (set key) (set (keys after))))
+      (err/fail! :input_rejected "paging cursor does not match this endpoint"))
+    (into {:limit (inc n) :size n}
+          (map (fn [k] [(keyword (str "after_" (name k))) (get after k)]) key))))
+
+(defn- page-rows [{:keys [key]} {:keys [size]} rows]
+  (if (> (count rows) size)
+    (let [kept (subvec (vec rows) 0 size)
+          last-row (peek kept)]
+      (when-not (every? #(contains? last-row %) key)
+        (err/fail! :internal (str "paged rows must carry the page key " (pr-str key))))
+      {:rows kept :next (encode-cursor (into (sorted-map) (select-keys last-row key)))})
+    {:rows (vec rows) :next nil}))
+
+(defn- run-endpoint [snap store ep match req request-id who]
+  (let [caller (authorize! snap store ep req who)
+        fl (get-in snap [:flows (:flow ep)])
+        raw (request-params (assoc req :query-params (query-string-params req)) match)
+        ;; ?trace=true: how each step ran, for callers holding spindle:trace (or admin)
+        trace? (trace-allowed? snap caller raw)
+        page (when-let [pg (:page ep)] (page-env pg raw))
+        params (flow/coerce-params (:params-schema fl) (dissoc raw :trace :size :after))
+        t0 (System/nanoTime)
+        compute #(flow/execute snap fl params {:caller caller :request-id request-id :trace? trace?
+                                                :page (some-> page (dissoc :size))})
+        c (when-not trace? (get-in snap [:caches (:id ep)]))
+        {:keys [value] cache-state :cache} (if c
+                                            (cache/lookup c (cache-key fl params caller page) compute)
+                                            {:value (compute) :cache :none})
+        {:keys [rows next]} (if page (page-rows (:page ep) page (:rows value)) {:rows (:rows value)})]
+    (when (= cache-state :stale) (metrics/counter! "spindle_cache_stale_served_total" {:endpoint (:id ep)}))
+    {:body {:rows rows :next next :meta (meta-of snap ep fl value cache-state t0)}}))
+
+;; --- batch route: POST /api/_batch/<endpoint-id> --------------------------------
+;; The key is a list (JSON array or "1,2,3"); the flow runs once for the keys the
+;; endpoint cache does not hold, rows are split per key (by :column, default the
+;; key) and cached per key, so single and batch calls share entries.
+
+(def batch-prefix "/api/_batch/")
+
+(defn- run-batch [snap store ep req request-id who]
+  (let [caller (authorize! snap store ep req who)
+        fl (get-in snap [:flows (:flow ep)])
+        {bk :key col :column} (:batch ep)
+        col (or col bk)
+        raw (request-params (assoc req :query-params (query-string-params req)) nil)
+        params (flow/coerce-params (:params-schema fl) (dissoc raw :trace))
+        ks (vec (distinct (get params bk)))
+        _ (when (empty? ks) (err/fail! :input_rejected (str "batch key " (name bk) " is empty")))
+        t0 (System/nanoTime)
+        c (get-in snap [:caches (:id ep)])
+        key-of (fn [k] (cache-key fl (assoc params bk [k]) caller nil))
+        hits (if c (into {} (keep (fn [k] (when-let [v (cache/peek-fresh c (key-of k))] [k v]))) ks) {})
+        missing (vec (remove #(contains? hits %) ks))
+        value (when (seq missing)
+                (flow/execute snap fl (assoc params bk missing) {:caller caller :request-id request-id}))
+        by-key (group-by #(get % col) (:rows value))]
+    (when (and c value (empty? (:partial value)) (empty? (:checks value)))
+      (doseq [k missing] (cache/put! c (key-of k) {:rows (vec (get by-key k [])) :partial [] :checks []})))
+    (when (and value (some #(not (contains? % col)) (:rows value)))
+      (err/fail! :internal (str "batch rows must echo the key column " (name col))))
+    {:body {:rows (vec (mapcat #(if-let [h (hits %)] (:rows h) (get by-key %)) ks))
+            :next nil
+            :meta (-> (meta-of snap ep fl (or value {}) (cond (empty? missing) :hit (empty? hits) (if c :miss :none) :else :partial) t0)
+                      (assoc :batch {:keys (count ks) :cached (count hits) :fetched (count missing)}))}}))
 
 ;; ---------------------------------------------------------------------------
 ;; status
@@ -234,6 +317,26 @@
        :body (io/input-stream res)}
       (json-resp 404 {:error {:code "not_found"}}))))
 
+(defn- endpoint-call
+  "Run one published call (`f` takes the `who` volatile) with metrics, activity and errors."
+  [ep request-id t0 f]
+  (let [snap (config/current)
+        ^java.util.concurrent.atomic.AtomicLong inflight (:inflight snap)
+        who (volatile! nil)]
+    (.incrementAndGet inflight)
+    (try
+      (let [{:keys [body status headers]} (f who)]
+        (metrics/timer! "spindle_request_seconds" {:endpoint (:id ep) :outcome "ok"} (- (System/nanoTime) t0))
+        (activity/record! {:endpoint (:id ep) :ms (/ (- (System/nanoTime) t0) 1e6) :caller @who :request-id request-id})
+        (json-resp (or status 200) body headers))
+      (catch Throwable e
+        (let [code (or (:spindle/code (err/code-of e)) :internal)]
+          (metrics/timer! "spindle_request_seconds" {:endpoint (:id ep) :outcome "error"} (- (System/nanoTime) t0))
+          (metrics/counter! "spindle_request_errors_total" {:endpoint (:id ep) :code (name code)})
+          (activity/record! {:endpoint (:id ep) :ms (/ (- (System/nanoTime) t0) 1e6) :code code :caller @who :request-id request-id}))
+        (error-resp e request-id))
+      (finally (.decrementAndGet inflight)))))
+
 (defn- handler* [{:keys [node-id config-dir store]} mcp-handler]
   (fn [req]
     (let [request-id (str (UUID/randomUUID))
@@ -277,26 +380,25 @@
                 (json-resp 200 {:evicted (stepcache/evict-tags! tags)}))
               (json-resp 404 {:error {:code "not_found"}})))
 
+          (= uri "/openapi.json")
+          (if (auth/authenticate (:auth snap) store req)
+            (json-resp 200 (openapi/document snap))
+            (json-resp 401 {:error {:code "unauthenticated" :message "missing or invalid API key"}}))
+
+          (str/starts-with? uri batch-prefix)
+          (let [id (subs uri (count batch-prefix))
+                ep (some #(when (and (= id (:id %)) (:batch %)) %) (:endpoints snap))]
+            (cond
+              (not ep) (json-resp 404 {:error {:code "not_found" :message "no batch endpoint with this id"}})
+              (not= :post (:request-method req)) (json-resp 405 {:error {:code "method_not_allowed"}})
+              :else (endpoint-call ep request-id t0 #(run-batch snap store ep req request-id %))))
+
           :else
           (if-let [match (and snap (r/match-by-path (:router snap) uri))]
             (let [ep (get-in match [:data :spindle.config/endpoint])]
               (if (not= (:request-method req) (:method ep))
                 (json-resp 405 {:error {:code "method_not_allowed"}})
-                (let [^java.util.concurrent.atomic.AtomicLong inflight (:inflight snap)
-                      who (volatile! nil)]
-                  (.incrementAndGet inflight)
-                  (try
-                    (let [{:keys [body]} (run-endpoint snap store ep match req request-id who)]
-                      (metrics/timer! "spindle_request_seconds" {:endpoint (:id ep) :outcome "ok"} (- (System/nanoTime) t0))
-                      (activity/record! {:endpoint (:id ep) :ms (/ (- (System/nanoTime) t0) 1e6) :caller @who :request-id request-id})
-                      (json-resp 200 body))
-                    (catch Throwable e
-                      (let [code (or (:spindle/code (err/code-of e)) :internal)]
-                        (metrics/timer! "spindle_request_seconds" {:endpoint (:id ep) :outcome "error"} (- (System/nanoTime) t0))
-                        (metrics/counter! "spindle_request_errors_total" {:endpoint (:id ep) :code (name code)})
-                        (activity/record! {:endpoint (:id ep) :ms (/ (- (System/nanoTime) t0) 1e6) :code code :caller @who :request-id request-id}))
-                      (error-resp e request-id))
-                    (finally (.decrementAndGet inflight))))))
+                (endpoint-call ep request-id t0 #(run-endpoint snap store ep match req request-id %))))
             (json-resp 404 {:error {:code "not_found" :message "no such endpoint"}})))
         (catch Throwable e (error-resp e request-id))))))
 

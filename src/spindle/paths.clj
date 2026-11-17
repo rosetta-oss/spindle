@@ -3,6 +3,8 @@
 
      [:params :order_id]            a request parameter
      [:caller :sub]                 the authenticated caller
+     [:page :limit]                 keyset paging: page size + 1; [:page :after_<key>]
+                                    the last key of the previous page (nil on page 1)
      [:order :customerid]           column of step :order's rows → distinct non-nil values
      [:stock :items 0 :on_hand]     nested path into each row / JSON value
 
@@ -11,17 +13,18 @@
    list must have exactly one element; more than one is an error, never a guess.")
 
 (defn step-ref [path] (when (and (vector? path) (keyword? (first path))
-                                 (not (#{:params :caller :fan} (first path))))
+                                 (not (#{:params :caller :fan :page} (first path))))
                         (first path)))
 
 (defn resolve-path
   "→ the value for `path` given request `params`, `caller` and step `results`
    ({step-id rows-or-value})."
-  [path {:keys [params caller results fan]}]
+  [path {:keys [params caller results fan page]}]
   (let [[root & more] path]
     (case root
       :params (get-in params more)
       :fan (get-in fan more)
+      :page (get-in page more)
       :caller (get-in caller more)
       (let [rows (get results root)
             rows (if (sequential? rows) rows (when (some? rows) [rows]))]

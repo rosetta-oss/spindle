@@ -55,7 +55,8 @@
    [:isolation {:optional true} [:enum :read-uncommitted :read-committed :repeatable-read :serializable]]
    [:fetch-size {:optional true} pos-int?]
    [:max-rows {:optional true} pos-int?]
-   [:max-in {:optional true} pos-int?]])
+   [:max-in {:optional true} pos-int?]
+   [:slow {:optional true} [:or string? int?]]])
 
 (def Connection
   [:multi {:dispatch :type}
@@ -81,7 +82,8 @@
            [:list-style {:optional true} [:enum :csv :repeat :postgrest-in]]
            [:forward-caller {:optional true} [:map-of string? [:vector {:min 2} keyword?]]]
            [:pool {:optional true} [:map [:connection-timeout {:optional true} [:or string? int?]]]]
-           [:defaults {:optional true} [:map [:timeout {:optional true} [:or string? int?]]]]
+           [:defaults {:optional true} [:map [:timeout {:optional true} [:or string? int?]]
+                                       [:slow {:optional true} [:or string? int?]]]]
            [:guard {:optional true} Guard]]]])
 
 (def Connections [:map-of keyword? Connection])
@@ -128,7 +130,10 @@
      [:method {:optional true} [:enum :get :post]]
      [:scopes {:optional true} [:set string?]]
      [:caller {:optional true} [:enum :required :optional]]
-     [:batch {:optional true} [:map [:key keyword?]]]]]])
+     [:batch {:optional true} [:map [:key keyword?] [:column {:optional true} keyword?]]]
+     [:page {:optional true} [:map [:key [:vector {:min 1} keyword?]]
+                              [:size {:optional true} pos-int?]
+                              [:max-size {:optional true} pos-int?]]]]]])
 
 ;; ---------------------------------------------------------------------------
 ;; reading
