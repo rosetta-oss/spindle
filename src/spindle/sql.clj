@@ -97,21 +97,47 @@
            (.setNull ps (int i) java.sql.Types/VARCHAR)))
     (.setObject ps (int i) v)))
 
+(defn- borrow-or-get
+  "The request's transaction connection (mutation flows), or one from the pool."
+  ^Connection [rt {:keys [con step-id]}]
+  (or (when con (con))
+      (try (.getConnection ^javax.sql.DataSource (:ds rt))
+           (catch Throwable t
+             (err/fail! (if (= :timeout (classify t false)) :unavailable (classify t false))
+                        "no database connection" {:step step-id :conn (:id rt)} t)))))
+
+(defn- give-back!
+  "Close a pooled connection (evicting it when a cancel left it in doubt); a
+   borrowed transaction connection stays open, and a cancel marks it broken."
+  [rt ^Connection c broken? {borrowed :con on-broken :on-broken}]
+  (cond
+    borrowed (when broken? (on-broken))
+    broken? (do (conn/evict! rt c) (try (.close c) (catch Throwable _ nil)))
+    :else (try (.close c) (catch Throwable _ nil))))
+
+(defn- execute-rows
+  "Run a prepared statement. Reads return rows; writes return their rows when
+   they have a result (RETURNING / OUTPUT) and otherwise [{:affected n}]."
+  [^PreparedStatement ps write? max-rows]
+  (if-not write?
+    (with-open [rs (.executeQuery ps)] (read-rows rs max-rows))
+    (if (.execute ps)
+      (with-open [rs (.getResultSet ps)] (read-rows rs max-rows))
+      [{:affected (.getUpdateCount ps)}])))
+
 (defn- run-one!
-  [rt ^String sql-text args {:keys [tuning deadline-ns cancels step-id tag max-rows limit]}]
-  (let [{:keys [ds] d :dialect} rt
+  [rt ^String sql-text args {:keys [tuning deadline-ns cancels step-id tag max-rows limit write? con] :as ctx}]
+  (let [{d :dialect} rt
         cancel-key (Object.)
         cancelled (AtomicBoolean. false)
         text (str "/* spindle " tag " */ " sql-text)]
-    (let [^Connection con (try (.getConnection ^javax.sql.DataSource ds)
-                               (catch Throwable t
-                                 (err/fail! (if (= :timeout (classify t false)) :unavailable (classify t false))
-                                            "no database connection" {:step step-id :conn (:id rt)} t)))
+    (let [^Connection con* (borrow-or-get rt ctx)
           broken (volatile! false)]
       (try
         (when-let [iso (:isolation tuning)]
-          (when (:isolation? d) (.setTransactionIsolation con (int (dialect/isolation-levels iso)))))
-        (with-open [^PreparedStatement ps (.prepareStatement con text)]
+          ;; inside a transaction the isolation was set when it opened
+          (when (and (not con) (:isolation? d)) (.setTransactionIsolation con* (int (dialect/isolation-levels iso)))))
+        (with-open [^PreparedStatement ps (.prepareStatement con* text)]
           (doseq [[i v] (map-indexed vector args)]
             (bind! ps (inc i) v))
           (.setQueryTimeout ps (int (min (remaining-s deadline-ns)
@@ -121,8 +147,7 @@
           (when-let [fs (:fetch-size tuning)] (.setFetchSize ps (int fs)))
           (register-cancel! cancels cancel-key (fn [] (.set cancelled true) (try (.cancel ps) (catch Throwable _ nil))))
           (try
-            (with-open [rs (.executeQuery ps)]
-              (read-rows rs max-rows))
+            (execute-rows ps write? max-rows)
             (catch Throwable t
               (vreset! broken (.get cancelled))
               (let [code (classify t (.get cancelled))]
@@ -130,16 +155,14 @@
                            {:step step-id :conn (:id rt)} t)))
             (finally (deregister-cancel! cancels cancel-key))))
         (finally
-          (if @broken
-            ;; a cancelled connection may be mid-protocol: do not hand it to the next borrower
-            (do (conn/evict! rt con) (try (.close con) (catch Throwable _ nil)))
-            (try (.close con) (catch Throwable _ nil))))))))
+          ;; a cancelled connection may be mid-protocol: never hand it to the next borrower
+          (give-back! rt con* @broken ctx))))))
 
 (defn run-step!
   "Execute a compiled :sql step with resolved `values` (placeholder → value).
    IN lists are chunked to the dialect's limit; chunks run one after another on
    this request's share of the connection."
-  [rt {:keys [scanned id tuning max-rows] :as _step} values ctx]
+  [rt {:keys [scanned id tuning max-rows write?] :as _step} values ctx]
   (let [max-in (or (:max-in tuning) (:max-in (:dialect rt)))
         renders (sqlfile/chunked-renders scanned values max-in)
         ;; :take (≤ the row cap) returns at most that many rows instead of failing:
@@ -149,7 +172,7 @@
       (if-let [[text & args] (first rs)]
         (let [left (if take (- take (count acc)) (when max-rows (- max-rows (count acc))))
               rows (conn/guarded rt #(run-one! rt text args (-> ctx (dissoc :take)
-                                                                (assoc :tuning tuning :step-id id)
+                                                                (assoc :tuning tuning :step-id id :write? write?)
                                                                 (merge (if take {:max-rows nil :limit left} {:max-rows left})))))
               acc (into acc rows)]
           (if (and take (>= (count acc) take)) (subvec acc 0 take) (recur (rest rs) acc)))
@@ -211,11 +234,21 @@
    :char java.sql.Types/CHAR :date java.sql.Types/DATE :timestamp java.sql.Types/TIMESTAMP
    :boolean java.sql.Types/BOOLEAN :cursor java.sql.Types/REF_CURSOR :other java.sql.Types/OTHER})
 
+(defn native-call?
+  "PostgreSQL procedures (CREATE PROCEDURE) need a native CALL statement: the
+   driver turns the JDBC escape into SELECT, which only works for functions."
+  [rt step]
+  (and (:procedure step) (= :postgres (get-in rt [:cfg :dialect]))))
+
 (defn call-text
-  "{call name(?,...)} or {? = call name(?,...)} with a return status. No statement
-   tag: drivers recognise the JDBC call escape only at the start of the text."
-  [{:keys [call args status]}]
-  (str "{" (when status "? = ") "call " call "(" (str/join "," (repeat (count args) "?")) ")}"))
+  "{call name(?,...)} or {? = call name(?,...)} with a return status, or a
+   native `call name(?,...)` (see native-call?). No statement tag: drivers
+   recognise the JDBC call escape only at the start of the text."
+  ([step] (call-text step false))
+  ([{:keys [call args status]} native?]
+   (if native?
+     (str "call " call "(" (str/join "," (repeat (count args) "?")) ")")
+     (str "{" (when status "? = ") "call " call "(" (str/join "," (repeat (count args) "?")) ")}"))))
 
 (defn- narrow
   "Integers that fit are bound as int: databases pick a procedure or function by
@@ -243,37 +276,44 @@
       :else (recur (.getMoreResults cs) sets (inc n)))))
 
 (defn- proc-once!
-  [rt {:keys [args status max-rows id] :as step} values {:keys [tuning deadline-ns cancels tag]}]
-  (let [{:keys [ds]} rt
-        cancel-key (Object.)
+  [rt {:keys [args status max-rows id] :as step} values {:keys [tuning deadline-ns cancels] borrowed :con :as ctx}]
+  (let [cancel-key (Object.)
         cancelled (AtomicBoolean. false)
-        cursors? (some #(= :cursor (:type %)) (filter map? args))
-        ^Connection con (try (.getConnection ^javax.sql.DataSource ds)
-                             (catch Throwable t
-                               (err/fail! (if (= :timeout (classify t false)) :unavailable (classify t false))
-                                          "no database connection" {:step id :conn (:id rt)} t)))
+        ;; cursors (PostgreSQL refcursor) only live inside a transaction: outside a
+        ;; mutation, a read-only one is opened here and rolled back afterwards
+        cursors? (and (not borrowed) (some #(= :cursor (:type %)) (filter map? args)))
+        ^Connection con (borrow-or-get rt (assoc ctx :step-id id))
         broken (volatile! false)
-        off (if status 2 1)]
+        native? (native-call? rt step)
+        off (if (and status (not native?)) 2 1)]
     (try
-      ;; cursors (PostgreSQL refcursor) only live inside a transaction; it is rolled back afterwards
       (when cursors? (.setAutoCommit con false))
-      (with-open [^java.sql.CallableStatement cs (.prepareCall con (call-text step))]
-        (when status (.registerOutParameter cs 1 java.sql.Types/INTEGER))
+      (with-open [^java.sql.CallableStatement cs (.prepareCall con (call-text step native?))]
+        (when (and status (not native?)) (.registerOutParameter cs 1 java.sql.Types/INTEGER))
         (doseq [[i a] (map-indexed vector args)
                 :let [idx (int (+ off i))]]
-          (if (map? a)
-            (do (when (:inout a) (bind! cs idx (narrow (get values (:out a)))))
-                (.registerOutParameter cs idx (int (proc-types (:type a)))))
-            (bind! cs idx (narrow (get values a)))))
+          (cond
+            ;; native CALL: OUT parameters are passed as NULL and come back as one result row
+            (and (map? a) native?) (bind! cs idx (when (:inout a) (narrow (get values (:out a)))))
+            (map? a) (do (when (:inout a) (bind! cs idx (narrow (get values (:out a)))))
+                         (.registerOutParameter cs idx (int (proc-types (:type a)))))
+            :else (bind! cs idx (narrow (get values a)))))
         (.setQueryTimeout cs (int (min (remaining-s deadline-ns)
                                        (long (Math/ceil (/ (conn/parse-duration-ms (:timeout tuning) 30000) 1000.0))))))
         (register-cancel! cancels cancel-key (fn [] (.set cancelled true) (try (.cancel cs) (catch Throwable _ nil))))
         (try
           (let [sets (read-all-results cs (.execute cs) max-rows)
-                outs (into {} (for [[i a] (map-indexed vector args) :when (map? a)]
+                out-args (filter map? args)]
+            (if native?
+              ;; the procedure's OUT values are the single row CALL returns
+              (let [row (when (seq out-args) (first (first sets)))]
+                {:sets (if (seq out-args) (vec (rest sets)) sets)
+                 :outs (into {} (for [a out-args] [(:out a) (get row (keyword (str/lower-case (name (:out a)))))]))
+                 :status nil})
+              {:sets sets
+               :outs (into {} (for [[i a] (map-indexed vector args) :when (map? a)]
                                 [(:out a) (out-value (.getObject cs (int (+ off i))) max-rows)]))
-                st (when status (let [v (.getObject cs 1)] (when v (long v))))]
-            {:sets sets :outs outs :status st})
+               :status (when status (let [v (.getObject cs 1)] (when v (long v))))}))
           (catch Throwable t
             (vreset! broken (.get cancelled))
             (let [code (classify t (.get cancelled))]
@@ -282,9 +322,7 @@
           (finally (deregister-cancel! cancels cancel-key))))
       (finally
         (when cursors? (try (.rollback con) (.setAutoCommit con true) (catch Throwable _ (vreset! broken true))))
-        (if @broken
-          (do (conn/evict! rt con) (try (.close con) (catch Throwable _ nil)))
-          (try (.close con) (catch Throwable _ nil)))))))
+        (give-back! rt con @broken ctx)))))
 
 (defn run-proc!
   "Call a compiled :proc step. → rows, or {:spindle/sets {name rows} :spindle/self rows}

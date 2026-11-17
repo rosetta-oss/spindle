@@ -90,7 +90,7 @@
       (is (some #(re-find #"cycle" (:message %)) (:problems (config/reload! *dir*)))))
     (testing "writes are refused in read flows"
       (write! *dir* "flows/shop/bad.edn" (pr-str {:steps [{:id :x :kind :sql :conn :shop :sql "delete from orders"}]}))
-      (is (some #(re-find #"read statements" (:message %)) (:problems (config/reload! *dir*)))))
+      (is (some #(re-find #"needs a mutation endpoint" (:message %)) (:problems (config/reload! *dir*)))))
     (testing "a good new flow is picked up; the pool is carried over"
       (io/delete-file (io/file *dir* "flows/shop/bad.edn"))
       (let [ds-before (get-in (config/current) [:conns :shop :ds])]

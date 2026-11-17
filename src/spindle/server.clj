@@ -13,7 +13,9 @@
             [spindle.conn :as conn]
             [spindle.error :as err]
             [spindle.flow :as flow]
+            [spindle.jsonout :as jsonout]
             [spindle.mcp :as mcp]
+            [spindle.mutation :as mutation]
             [spindle.openapi :as openapi]
             [spindle.metrics :as metrics]
             [spindle.stepcache :as stepcache]
@@ -22,13 +24,7 @@
   (:import [java.time Instant LocalDate LocalDateTime LocalTime OffsetDateTime]
            [java.util UUID]))
 
-(def ^:private mapper
-  (json/object-mapper
-   {:encoders {LocalDate (fn [v ^com.fasterxml.jackson.core.JsonGenerator g] (.writeString g (str v)))
-               LocalDateTime (fn [v ^com.fasterxml.jackson.core.JsonGenerator g] (.writeString g (str v)))
-               LocalTime (fn [v ^com.fasterxml.jackson.core.JsonGenerator g] (.writeString g (str v)))
-               OffsetDateTime (fn [v ^com.fasterxml.jackson.core.JsonGenerator g] (.writeString g (str v)))
-               Instant (fn [v ^com.fasterxml.jackson.core.JsonGenerator g] (.writeString g (str v)))}}))
+(def ^:private mapper jsonout/mapper)
 
 ;; JSON integers read as Long, like query-string numbers: cache keys and key
 ;; lookups then agree whichever way a parameter arrived.
@@ -138,6 +134,8 @@
       {:rows kept :next (encode-cursor (into (sorted-map) (select-keys last-row key)))})
     {:rows (vec rows) :next nil}))
 
+(declare run-read)
+
 (defn- run-endpoint [snap store ep match req request-id who]
   (let [caller (authorize! snap store ep req who)
         fl (get-in snap [:flows (:flow ep)])
@@ -146,8 +144,14 @@
         trace? (trace-allowed? snap caller raw)
         page (when-let [pg (:page ep)] (page-env pg raw))
         params (flow/coerce-params (:params-schema fl) (dissoc raw :trace :size :after))
-        t0 (System/nanoTime)
-        compute #(flow/execute snap fl params {:caller caller :request-id request-id :trace? trace?
+        t0 (System/nanoTime)]
+    (if (:mutation ep)
+      (mutation/run snap ep fl params caller request-id (get-in req [:headers "idempotency-key"])
+                    #(meta-of snap ep fl % :none t0))
+      (run-read snap ep fl params caller request-id trace? page t0))))
+
+(defn- run-read [snap ep fl params caller request-id trace? page t0]
+  (let [compute #(flow/execute snap fl params {:caller caller :request-id request-id :trace? trace?
                                                 :page (some-> page (dissoc :size))})
         c (when-not trace? (get-in snap [:caches (:id ep)]))
         {:keys [value] cache-state :cache} (if c

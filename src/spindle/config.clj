@@ -107,7 +107,8 @@
    [:stale {:optional true} [:or string? int?]]
    [:stale-if-error {:optional true} [:or string? int?]]
    [:empty-ttl {:optional true} [:or string? int?]]
-   [:max-entries {:optional true} pos-int?]])
+   [:max-entries {:optional true} pos-int?]
+   [:tags {:optional true} [:vector [:or keyword? string?]]]])
 
 (def Request
   [:map {:closed true}
@@ -130,6 +131,7 @@
    [:rows {:optional true} string?]
    [:fan-out {:optional true} Path]
    [:or-else {:optional true} keyword?]
+   [:after {:optional true} [:vector keyword?]]
    [:when {:optional true} [:or map? vector?]]
    [:default {:optional true} any?]
    [:cache {:optional true} StepCache]
@@ -146,7 +148,10 @@
    [:results {:optional true} [:vector keyword?]]
    [:status {:optional true} keyword?]
    [:fail-on-status {:optional true} keyword?]
-   [:read-only {:optional true} boolean?]])
+   [:read-only {:optional true} boolean?]
+   [:procedure {:optional true} boolean?]     ; PostgreSQL CREATE PROCEDURE → native CALL
+   ;; writes
+   [:expect {:optional true} [:map {:closed true} [:rows nat-int?]]]])
 
 (def Output
   [:schema {:registry
@@ -172,8 +177,15 @@
 (def Endpoint
   [:map {:closed true}
    [:path string?]
-   [:method {:optional true} [:enum :get :post]]
+   [:method {:optional true} [:enum :get :post :put :patch :delete]]
    [:doc {:optional true} string?]
+   ;; mutations (design §8)
+   [:mutation {:optional true} boolean?]
+   [:commit-order {:optional true} [:vector keyword?]]
+   [:idempotency {:optional true} [:map {:closed true} [:conn keyword?] [:table {:optional true} string?]
+                                   [:required {:optional true} boolean?]]]
+   [:audit {:optional true} [:map {:closed true} [:conn keyword?] [:table {:optional true} string?]]]
+   [:evicts {:optional true} [:vector [:or keyword? string?]]]
    [:scopes {:optional true} [:set string?]]
    [:caller {:optional true} [:enum :required :optional]]
    [:batch {:optional true} [:map {:closed true} [:key keyword?] [:column {:optional true} keyword?]]]

@@ -76,7 +76,10 @@
     (case (or method :get)
       :get (.GET b)
       :post (.POST (.header b "Content-Type" "application/json")
-                   (HttpRequest$BodyPublishers/ofString (or body-str "{}"))))
+                   (HttpRequest$BodyPublishers/ofString (or body-str "{}")))
+      (:put :patch) (.method (.header b "Content-Type" "application/json") (str/upper-case (name method))
+                             (HttpRequest$BodyPublishers/ofString (or body-str "{}")))
+      :delete (.DELETE b))
     {:request (.build b) :timeout-ms timeout-ms}))
 
 (defn- classify-status [s]

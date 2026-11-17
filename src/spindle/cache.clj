@@ -88,6 +88,8 @@
 
 (defn put! [{:keys [^Cache cache]} k v] (.put cache k {:value v :at (now)}) v)
 
+(defn clear! [{:keys [^Cache cache]}] (.invalidateAll cache))
+
 (defn stats [{:keys [^Cache cache]}]
   (let [s (.stats cache)]
     {:entries (.estimatedSize cache) :hits (.hitCount s) :misses (.missCount s)}))

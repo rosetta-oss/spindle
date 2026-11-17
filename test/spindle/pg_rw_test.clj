@@ -143,3 +143,102 @@
       (let [t0 (System/currentTimeMillis) r (call :get "/it/slow?secs=10")]
         (is (= 504 (:status r)))
         (is (< (- (System/currentTimeMillis) t0) 4000))))))
+
+;; ---------------------------------------------------------------------------
+;; writes (mutation endpoints)
+;; ---------------------------------------------------------------------------
+
+(def write-schema-sql
+  ["create table if not exists spindle_it.spindle_idempotency (endpoint varchar(200) not null, idem_key varchar(128) not null,
+      request_hash char(64) not null, response text not null, created_at timestamp not null, primary key (endpoint, idem_key))"
+   "create table if not exists spindle_it.spindle_audit (at timestamp not null, request_id varchar(64), endpoint varchar(200),
+      flow_version varchar(32), client varchar(128), sub varchar(256), idem_key varchar(128), conns varchar(400),
+      affected text, outcome varchar(16), ms int, params_hash char(16))"
+   "create procedure spindle_it.add_line(p_order int, p_sku text, p_qty int, p_price numeric)
+      language sql as $$ insert into spindle_it.lines select p_order, coalesce(max(line), 0) + 1, p_sku, p_qty, p_price
+                          from spindle_it.lines where order_id = p_order $$"])
+
+(defn- q1 [sql & args] (first (jdbc/execute! (ds) (into [sql] args))))
+
+(defn- mutation-flows! []
+  (write! "flows/it/comment.edn"
+          (pr-str {:params '[:map [:id pos-int?] [:comment [:string {:max 100}]]]
+                   :steps [{:id :upd :kind :sql :conn :pg :in {:id [:params :id] :comment [:params :comment]}
+                            :expect {:rows 1}
+                            :sql "update spindle_it.orders set comment = :comment where id = :id"}
+                           ;; a read on the same connection sees the write (same transaction)
+                           {:id :order :kind :sql :conn :pg :in {:id [:params :id]} :after [:upd]
+                            :sql "select id, comment from spindle_it.orders where id = :id"}]
+                   :output {:from :order :one? true}
+                   :endpoint {:path "/it/orders/{id}/comment" :method :put :mutation true :scopes #{"write"}
+                              :idempotency {:conn :pg :table "spindle_it.spindle_idempotency"}
+                              :audit {:conn :pg :table "spindle_it.spindle_audit"}
+                              :evicts ["orders"]}}))
+  (write! "flows/it/two-writes.edn"
+          (pr-str {:params '[:map [:id pos-int?] [:sku string?] [:qty pos-int?] [:price number?] [:fail {:optional true} boolean?]]
+                   :steps [{:id :add :kind :proc :conn :pg :call "spindle_it.add_line" :procedure true
+                            :args [:order :sku :qty :price]
+                            :in {:order [:params :id] :sku [:params :sku] :qty [:params :qty] :price [:params :price]}}
+                           {:id :total :kind :sql :conn :pg :in {:id [:params :id]} :expect {:rows 1} :after [:add]
+                            :sql "update spindle_it.orders set total = (select sum(qty * price) from spindle_it.lines where order_id = :id) where id = :id returning id, total"}
+                           ;; fails after both writes when asked: everything rolls back
+                           {:id :boom :kind :sql :conn :pg :in {:f [:params :fail]}
+                            :when [:= [:params :fail] true] :after [:total]
+                            :sql "select 1 / (cast(:f as int) - 1) as x"}]
+                   :output {:from :total :one? true}
+                   :endpoint {:path "/it/orders/{id}/lines" :method :post :mutation true :scopes #{"write"}}}))
+  ;; a cached read that the comment mutation evicts
+  (write! "flows/it/cached.edn"
+          (pr-str {:params '[:map [:id pos-int?]]
+                   :steps [{:id :o :kind :sql :conn :pg :in {:id [:params :id]} :cache {:ttl "60s" :tags [:orders]}
+                            :sql "select id, comment from spindle_it.orders where id = :id"}]
+                   :output {:from :o :one? true}
+                   :endpoint {:path "/it/orders/{id}/cached"}})))
+
+(deftest mutations
+  (when (enabled?)
+    (doseq [s write-schema-sql] (try (jdbc/execute! (ds) [s]) (catch Exception _ nil)))
+    (mutation-flows!)
+    (let [r (reload)] (is (:ok r) (pr-str r)))
+    (testing "a write and a read in one transaction; committed; audited"
+      (is (nil? (get-in (call :get "/it/orders/1/cached") [:json :rows :comment])) "cache filled before the write")
+      (let [r (call :put "/it/orders/1/comment" {:body {:comment "rush"} :headers {"idempotency-key" "k-1"}})]
+        (is (= 200 (:status r)) (pr-str (:json r)))
+        (is (= {:id 1 :comment "rush"} (get-in r [:json :rows])) "the read saw the write")
+        (is (= "committed" (get-in r [:json :meta :outcome])))
+        (is (= {:upd 1} (get-in r [:json :meta :affected]))))
+      (is (= "rush" (:orders/comment (q1 "select comment from spindle_it.orders where id = 1"))))
+      (is (= "committed" (:spindle_audit/outcome (q1 "select outcome from spindle_it.spindle_audit where idem_key = 'k-1'")))))
+    (testing ":evicts cleared the tagged cache"
+      (is (= "rush" (get-in (call :get "/it/orders/1/cached") [:json :rows :comment]))))
+    (testing "idempotency: same key and request → stored response, not run again"
+      (jdbc/execute! (ds) ["update spindle_it.orders set comment = 'changed elsewhere' where id = 1"])
+      (let [r (call :put "/it/orders/1/comment" {:body {:comment "rush"} :headers {"idempotency-key" "k-1"}})]
+        (is (= 200 (:status r)))
+        (is (true? (get-in r [:json :meta :idempotent_replay])))
+        (is (= "changed elsewhere" (:orders/comment (q1 "select comment from spindle_it.orders where id = 1"))))))
+    (testing "same key, different request → 409"
+      (is (= 409 (:status (call :put "/it/orders/1/comment" {:body {:comment "other"} :headers {"idempotency-key" "k-1"}})))))
+    (testing ":expect: no row matched → 404, rolled back"
+      (let [r (call :put "/it/orders/999/comment" {:body {:comment "x"}})]
+        (is (= 404 (:status r)))
+        (is (= "rolled_back" (get-in r [:json :error :outcome])))))
+    (testing "a procedure and an update commit together"
+      (let [r (call :post "/it/orders/2/lines" {:body {:sku "Z" :qty 2 :price 5}})]
+        (is (= 200 (:status r)) (pr-str (:json r)))
+        (is (= 13.0 (double (get-in r [:json :rows :total]))))
+        (is (= 2 (:count (q1 "select count(*) from spindle_it.lines where order_id = 2"))))))
+    (testing "a failure after the writes rolls everything back"
+      (let [before (q1 "select total from spindle_it.orders where id = 2")
+            r (call :post "/it/orders/2/lines" {:body {:sku "Q" :qty 1 :price 1 :fail true}})]
+        (is (= 502 (:status r)))
+        (is (= "rolled_back" (get-in r [:json :error :outcome])))
+        (is (= 2 (:count (q1 "select count(*) from spindle_it.lines where order_id = 2"))) "the procedure's insert was rolled back")
+        (is (= before (q1 "select total from spindle_it.orders where id = 2")))))
+    (testing "a trial run (no commit) never writes"
+      (let [snap (config/current)
+            fl (get-in snap [:flows "it/comment"])
+            r (spindle.flow/execute snap fl {:id 1 :comment "trial"} {:caller {:client "it"}})]
+        (is (= :rolled_back (:outcome r)))
+        (is (= {:id 1 :comment "trial"} (:rows r)) "the trial sees its own write")
+        (is (= "changed elsewhere" (:orders/comment (q1 "select comment from spindle_it.orders where id = 1"))))))))
