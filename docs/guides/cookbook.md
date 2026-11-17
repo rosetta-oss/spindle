@@ -239,6 +239,8 @@ per caller, so one user's rows are never served to another.
 - A procedure counts as a write unless `:read-only true`; writing procedures belong in mutation endpoints.
 - **ASE:** the dialect sets jConnect's `IGNORE_DONE_IN_PROC=true`; without it the row counts of statements inside a
   procedure hide its result sets. Don't turn it off in `:properties`.
+- Check what a procedure returns before using `:fail-on-status :non-zero`: some return a row count or a code
+  (e.g. `return @@rowcount`), and then success is non-zero.
 
 ## 8d. Writes (mutation endpoints)
 

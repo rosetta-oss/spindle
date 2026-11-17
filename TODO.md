@@ -32,7 +32,12 @@ Where work continues after 2026-11-17. Everything up to `04110f7` was built and 
   - [x] an undeclared extra result set fails ("procedure returned 3 result sets; the step names 2");
   - [x] `IGNORE_DONE_IN_PROC`: with jConnect's default the in-procedure row counts hide the result sets and
         multi-set procedures fail. The ASE dialect now sets it to `true` by default.
-  - [ ] a procedure of our own (needs the test database), including the transaction-mode item below.
+  - [x] real read-only CIS procedures (2026-11-17), all 200 through `:proc`:
+        `ap_pub_get_cust_basic_info` (named result set; its status is `@@rowcount`, so no `:fail-on-status` there),
+        `get_company_info` (OUT parameters; unknown company → status -101 → 502),
+        `ap_vendor_open_doc_cnt_query` (OUT `doc_cnt`), `cust_notes_other_notes` (date string parameter).
+        Of 3564 procedures in CIS, 165 contain no insert/update/delete/exec/select-into by a source scan.
+  - [ ] writing procedures: skipped for now (needs the test database), with the transaction-mode item below.
 - [ ] **Writes (mutation endpoints):**
   - [ ] update + read-back in one transaction;
   - [ ] rollback on failure;
