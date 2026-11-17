@@ -25,6 +25,42 @@ Licence: **EPL-2.0**. Open source.
 | D15 | Development and integration tests run on PostgreSQL AdventureWorks, MySQL 8.4 and ClickHouse 26 containers. ASE is tested only on the company test server. |
 | D16 | 2026-11-17 review of the instruction set: flow maps are closed (typos are load errors); `:spindle/format 1`; one `[:op …]` language for `:when`, `:derive` and `:assert` (the map `:when` form stays accepted); `:views` publish several projections of one set of steps; `:merge` with several matches is an error unless `:pick :first`; a path to a column no SQL row has is an error; row-cap precedence is step > flow `:limits` > connection; a step skipped for empty input returns its `:default`. |
 | D17 | 2026-11-17 built on PostgreSQL: `:proc` (ordered `:args`, OUT, status, named result sets and cursors; integers that fit are bound as int so overloads resolve; PostgreSQL procedures via native CALL with `:procedure true`; no statement tag on calls); writes (one transaction per connection, `:expect`, `:after`, idempotency record in the same transaction, audit line and table, `:evicts`; trial runs roll back); JWT via nimbus-jose-jwt; parallel fan-out and IN chunks. |
+| D18 | 2026-11-17 positioning: a checked data-access instruction set for legacy databases, feeding a semantic graph. Not an API gateway, not a workflow engine, not automatic CRUD. Writes stay small, synchronous and on one connection; cross-system writes go to an asynchronous engine. Features are frozen, except fixes needed for ASE, until the first real graph is measured. See "Positioning" below. |
+
+## Positioning (2026-11-17)
+
+**One sentence.** A data-access instruction set for legacy databases (Sybase ASE first): hand-written SQL and API
+calls, composed into small, checked flows, published as APIs for a semantic graph (Semalith).
+
+**Where it sits.**
+
+| Layer | Owns | Spindle's relation |
+|---|---|---|
+| Semantic graph (Semalith, Pathom) | composition across business objects, the vocabulary callers ask in | Spindle serves it one object per flow, in batches |
+| **Spindle** | fetching one object close to its source: SQL as written, procedures, upstream APIs, checks on the result | — |
+| Asynchronous engine (Flow + Temporal) | waiting, retries over time, schedules, compensation, cross-system writes | not Spindle's job |
+| API gateway | public routing, tenant auth, quotas | Spindle only does what it needs itself |
+
+**The differentiator.** Database MCP servers let an agent *call* SQL. Spindle lets an agent *author* an API whose
+safety the engine checks before it goes live: closed schemas, a timeout and a row cap on every SQL step, an
+archived explain, `:assert` on the result. People and graphs then call that API. This is the same split as in
+dossier: the agent defines, the engine guarantees, people judge.
+
+**Not:**
+
+- **an API gateway.** Keys, JWT, scopes and rate limits go only as far as Spindle itself needs.
+- **a workflow engine.** Flows are synchronous, have a deadline and at most 16 steps.
+- **automatic CRUD.** Spindle never generates APIs from tables, and publishes only written, checked flows.
+
+**Writes boundary.** A mutation endpoint does a synchronous write on one connection, in one transaction
+(a comment, a status, a small set of rows). Writes across systems, writes that need retries over time and
+writes that need compensation belong in the asynchronous engine. Two connections in one mutation is allowed
+(the `partial` outcome exists) but should be the exception.
+
+**Proof before features.** Success is the first-release goal: one real graph with fewer upstream calls, lower p95
+latency and fewer ASE lock waits. Until that is measured, only fixes that ASE verification needs are added (for
+example a procedure transaction-mode option). Open source is a by-product of a clean design. The users are the
+graph and its team, so no feature is added only to attract outside users.
 
 ## First release (scope agreed 2026-11-17)
 
@@ -194,6 +230,8 @@ Non-goals:
 - **Two-phase commit** across connections (§8.3).
 - **Automatic exposure of whole tables**, PostgREST-style.
 - **Bulk data movement (ETL)** and BI dashboards.
+- **API gateway** features beyond what Spindle itself needs (see "Positioning").
+- **Writes across systems** in one flow; those belong in an asynchronous engine.
 
 ## 2. Core concepts
 

@@ -21,7 +21,7 @@
   (is (= ["set rowcount 0"] (:session-reset ase)))
   (is (every? true? ((juxt :isolation? :transactions? :procedures?) ase)))
   (testing "the jConnect URL is used as written"
-    (is (= "jdbc:sybase:Tds:h:4100/CIS" (dialect/url-for ase "jdbc:sybase:Tds:h:4100/CIS")))))
+    (is (= "jdbc:sybase:Tds:h:4100/sales" (dialect/url-for ase "jdbc:sybase:Tds:h:4100/sales")))))
 
 (deftest ase-in-list-chunking
   (let [sc (sf/scan "select id from master..sysobjects where id in :ids")

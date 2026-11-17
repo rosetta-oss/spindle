@@ -4,14 +4,38 @@ Spindle runs small data flows on request and publishes each one as an HTTP API.
 
 - **Steps:** each step runs **SQL** against a database or calls an **HTTP API**, and the two can be mixed.
 - **Data between steps:** a step reads earlier results through data paths (`[:order :customer_id]`).
-- **Conditions:** a step can run only when a condition holds (`:when {:exists [:cust]}`).
-- **Output:** the results are projected and merged into one output.
+- **Conditions:** a step can run only when a condition holds (`:when [:exists [:cust]]`).
+- **Output:** the results are projected and merged into one output, with derived fields and checks (`:derive`, `:assert`).
 - **Protection:** every connection has a pool, a circuit breaker, a bulkhead, a rate limit and a step cache,
   and every request has a deadline that really cancels statements.
 - **Operations:** the configuration is hot-reloaded. Nodes are stateless, so you can run as many as you like.
 
 Spindle is built for semantic or graph layers, for example Semalith with Pathom3, that need clean, batchable,
 cacheable APIs in front of legacy databases (Sybase ASE) and heavy upstream APIs.
+
+## Positioning
+
+> **A data-access instruction set for legacy databases (Sybase ASE first): hand-written SQL and API calls,
+> composed into small, checked flows, published as APIs for a semantic graph (Semalith).**
+
+- **One business object per flow, fetched close to its source.** Composing objects (customer → orders → shipments)
+  is the graph's job.
+- **Written by people or agents, guaranteed by the engine.** Flows are data that the engine checks before they go
+  live: closed schemas, a timeout and a row cap on every SQL step, an archived explain, `:assert` on the result.
+  Tools such as database MCP servers let an agent *call* SQL; Spindle lets an agent *author* a checked API that
+  graphs and people then call.
+- **Spindle is not:**
+  - **an API gateway.** Authentication, routing and rate limits go only as far as Spindle itself needs.
+  - **a workflow engine.** Flows are synchronous, have a deadline and at most 16 steps. Anything that waits,
+    retries over time or runs on a schedule belongs in an asynchronous engine.
+  - **automatic CRUD.** Spindle never generates APIs from table definitions. It publishes only flows that were
+    written and checked.
+- **Writes are small and local.** A mutation endpoint does a synchronous write on one connection, in one
+  transaction (for example a comment or a status). Writes that span systems, need retries over time or need
+  compensation belong in an asynchronous workflow engine.
+- **Proof before features.** The first release succeeds when one real graph gets fewer upstream calls, a lower
+  p95 latency and fewer ASE lock waits. Until that is measured, only fixes that ASE verification needs are added.
+  Open source is a by-product of a clean design, not a goal: the users are the graph and its team.
 
 - Licence: **EPL-2.0**.
 - Design: [docs/design/0001-spindle-design.md](docs/design/0001-spindle-design.md). The section "First release" covers the current scope.

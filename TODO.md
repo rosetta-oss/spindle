@@ -4,11 +4,14 @@ Where work continues after 2026-11-17. Everything up to `04110f7` was built and 
 (115 tests). Sybase ASE has not been tested yet. See `CHANGELOG.md` for what exists and
 `docs/guides/cookbook.md` for how to write flows.
 
+**Rule until the first real graph is measured:** no new features, only fixes that ASE verification needs
+(see "Positioning" in `README.md` and D18 in the design).
+
 ## 1. Set up in the company environment
 
 - [x] Put `jconn4.jar` in `drivers/` (never committed) and run `clojure -M:test`. The ASE tests skip themselves
       until `SPINDLE_IT_ASE_URL`, `SPINDLE_IT_ASE_USER` and `SPINDLE_IT_ASE_PASSWORD` are set.
-      2026-11-17: done on dev ASE (dev.synnex.org/CIS): 112 tests, 0 failures.
+      2026-11-17: done on the company's dev ASE: 112 tests, 0 failures.
 - [ ] Use a read-only login for reads, and a separate test database (or schema) for `:proc` and write tests.
       Never point write tests at a shared database.
 - [ ] Follow "Taking it over in the company environment" in `README.md` (config directory, keys, explain archive).
@@ -32,11 +35,10 @@ Where work continues after 2026-11-17. Everything up to `04110f7` was built and 
   - [x] an undeclared extra result set fails ("procedure returned 3 result sets; the step names 2");
   - [x] `IGNORE_DONE_IN_PROC`: with jConnect's default the in-procedure row counts hide the result sets and
         multi-set procedures fail. The ASE dialect now sets it to `true` by default.
-  - [x] real read-only CIS procedures (2026-11-17), all 200 through `:proc`:
-        `ap_pub_get_cust_basic_info` (named result set; its status is `@@rowcount`, so no `:fail-on-status` there),
-        `get_company_info` (OUT parameters; unknown company → status -101 → 502),
-        `ap_vendor_open_doc_cnt_query` (OUT `doc_cnt`), `cust_notes_other_notes` (date string parameter).
-        Of 3564 procedures in CIS, 165 contain no insert/update/delete/exec/select-into by a source scan.
+  - [x] real read-only business procedures on the company database (2026-11-17), all 200 through `:proc`:
+        a named result set, OUT parameters, a date string parameter, and a non-zero status → 502.
+        Caveat: some procedures return `@@rowcount` as their status, so `:fail-on-status` must not be used there.
+        Details stay in the company's private notes, not in this public repository.
   - [ ] writing procedures: skipped for now (needs the test database), with the transaction-mode item below.
 - [ ] **Writes (mutation endpoints):**
   - [ ] update + read-back in one transaction;
