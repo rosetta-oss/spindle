@@ -110,14 +110,37 @@
           (mapcat (fn [[_ sub]] (output-sources sub)) (:nest spec))))
 
 (defn prune
-  "Keep the steps the output reads, their dependencies and their fallbacks."
-  [steps out-spec]
-  (loop [keep #{} todo (set (remove nil? (output-sources out-spec)))]
+  "Keep the steps the output reads, their dependencies and their fallbacks.
+   `provided` maps names a :proc step provides to that step."
+  [steps out-spec provided]
+  (loop [keep #{} todo (set (map #(get provided % %) (remove nil? (output-sources out-spec))))]
     (if-let [id (first todo)]
       (let [st (get steps id)
-            more (remove keep (concat (:deps st) (some-> st :or-else vector)))]
+            more (remove keep (map #(get provided % %) (concat (:deps st) (some-> st :or-else vector))))]
         (recur (conj keep id) (into (disj todo id) more)))
       (select-keys steps keep))))
+
+(defn provides
+  "Names a :proc step adds to the results besides its own id: :results and cursor OUTs."
+  [{:keys [kind results args]}]
+  (when (= :proc kind)
+    (concat results (keep #(when (and (map? %) (= :cursor (:type %))) (:out %)) args))))
+
+(defn- proc-problems [{:keys [call args in results status fail-on-status]}]
+  (let [ins (set (filter keyword? args))
+        inouts (set (keep #(when (and (map? %) (:inout %)) (:out %)) args))
+        bound (set (keys in))]
+    (concat
+     (when-not (and (string? call) (re-matches #"[A-Za-z_#][A-Za-z0-9_.$#]*" call))
+       [":call must be a procedure name such as dbo.usp_order or sales.order_summary"])
+     (for [a args :when (not (or (keyword? a) (and (map? a) (keyword? (:out a)) (contains? sql/proc-types (:type a)))))]
+       (str "argument " (pr-str a) " must be an input name (keyword) or {:out :name :type t} with t in "
+            (pr-str (sort (keys sql/proc-types)))))
+     (for [p (set/difference (set/union ins inouts) bound)] (str "argument " p " has no binding in :in"))
+     (for [p (set/difference bound ins inouts)] (str "binding " p " is not an argument"))
+     (when (and fail-on-status (not= :non-zero fail-on-status)) [":fail-on-status takes :non-zero"])
+     (when (and fail-on-status (not status)) [":fail-on-status needs :status (the return status field)"])
+     (for [r results :when (not (keyword? r))] (str "result set name " (pr-str r) " must be a keyword")))))
 
 (declare compile-flow*)
 
@@ -125,8 +148,9 @@
   "→ {:flow compiled} or {:problems [...]}.
    `raw` is the flow EDN, `blocks` the .sql blocks, `conns` {id resolved-config}."
   [flow-id raw blocks conns]
-  (binding [result/*path-roots* (into path-roots-base
-                                      (map :id (or (:steps raw) (when (:sql raw) [{:id :main}]))))]
+  (binding [result/*path-roots* (into (into path-roots-base
+                                            (map :id (or (:steps raw) (when (:sql raw) [{:id :main}]))))
+                                      (mapcat provides (:steps raw)))]
     (compile-flow* flow-id raw blocks conns)))
 
 (defn- compile-flow* [flow-id raw blocks conns]
@@ -137,7 +161,10 @@
                       (when (:sql raw) [{:id :main :kind :sql :conn (:conn raw) :sql (:sql raw) :in (:in raw)}]))
         params-schema (try (m/schema (or (:params raw) [:map]))
                            (catch Exception e (add! [:params] (str "invalid malli schema: " (.getMessage e))) nil))
-        ids (set (map :id steps-raw))
+        ;; names a :proc step provides (its result sets, cursor OUTs) → that step
+        provided (into {} (for [s steps-raw n (provides s)] [n (:id s)]))
+        step-ids (set (map :id steps-raw))
+        ids (into step-ids (keys provided))
         compiled
         (into {}
               (for [{:keys [id conn in] :as s} steps-raw
@@ -166,7 +193,7 @@
                   (when-let [t (:take s)]
                     (when-not (or (pos-int? t) (and (vector? t) (= :params (first t))))
                       (add! [:steps id :take] "take must be a positive integer or a [:params ...] path")))
-                  (when (and (:or-else s) (not (ids (:or-else s))))
+                  (when (and (:or-else s) (not (step-ids (:or-else s))))
                     (add! [:steps id :or-else] (str "unknown fallback step " (:or-else s))))
                   [id
                    (case kind
@@ -208,8 +235,24 @@
                          (when-not (contains? #{:get :post nil} (get-in s [:request :method]))
                            (add! [:steps id :request :method] "only GET/POST reads are allowed for now"))
                          base)
-                     (do (add! [:steps id :kind] (str "unknown step kind " kind " (use :sql or :api)")) base))])))
-        deps (into {} (map (fn [[id s]] [id (set/intersection (:deps s) ids)])) compiled)
+                     :proc
+                     (do (when (and ccfg (not= :sql (:type ccfg)))
+                           (add! [:steps id :conn] "a :proc step needs an :sql connection"))
+                         (when (and ccfg (not (:procedures? d)))
+                           (add! [:steps id :conn] (str "dialect " (name (or (:dialect ccfg) :generic)) " has no stored procedures")))
+                         (doseq [p (proc-problems s)] (add! [:steps id] p))
+                         (when-not (:read-only s)
+                           (add! [:steps id :read-only]
+                                 "a procedure counts as a write: declare :read-only true (mutation endpoints come later)"))
+                         (when-not (get-in base [:tuning :timeout])
+                           (add! [:steps id :tuning :timeout] "every :proc step needs a timeout"))
+                         (let [mr (or (:max-rows s) (get-in s [:tuning :max-rows]) (get-in raw [:limits :max-rows])
+                                      (get-in ccfg [:defaults :max-rows]))]
+                           (when-not mr (add! [:steps id :max-rows] "every :proc step needs a row cap (per result set)"))
+                           (assoc base :max-rows mr :provides (vec (provides s)))))
+                     (do (add! [:steps id :kind] (str "unknown step kind " kind " (use :sql, :api or :proc)")) base))])))
+        ;; dependencies on a provided name are dependencies on the :proc step
+        deps (into {} (map (fn [[id s]] [id (set (keep #(get provided % (step-ids %)) (:deps s)))])) compiled)
         deadline-ms (conn/parse-duration-ms (get-in raw [:limits :timeout]) 5000)
         out-spec (try (output/compile-spec (merge {:from (first (map :id steps-raw))} (:output raw)))
                       (catch Exception e (add! [:output] (.getMessage e)) nil))]
@@ -241,7 +284,7 @@
               :view (:spindle/view raw)
               :params-schema params-schema
               ;; a view runs only the steps its output needs
-              :steps (if (:spindle/view raw) (prune compiled out-spec) compiled)
+              :steps (if (:spindle/view raw) (prune compiled out-spec provided) compiled)
               :output out-spec
               :deadline-ms deadline-ms
               :parallel (:parallel raw)
@@ -368,6 +411,10 @@
                    (:default step)
                    (cached step flow-id env [(:sql-text step) (into (sorted-map) values) take]
                            #(sql/run-step! rt step values (cond-> ctx (pos-int? take) (assoc :take take))))))
+          :proc (let [values (into {} (for [[k p] (:in step)]
+                                        [k (:value (paths/as-scalar (paths/resolve-path p env) k))]))]
+                  (cached step flow-id env [(:call step) (into (sorted-map) values)]
+                          #(sql/run-proc! rt step values ctx)))
           :http (let [env (cond-> env (seq (get-in rt [:cfg :forward-caller])) (assoc :forward-caller (get-in rt [:cfg :forward-caller])))]
                   (httpstep/extract
                    step
@@ -385,8 +432,8 @@
         trace (when trace? (atom {}))
         env (cond-> {:params params :caller caller :deadline-ns deadline-ns :parallel (:parallel flow)
                      :page page :flow-version (:version flow) :request-id request-id
-                     :step-ids (set (keys (:steps flow)))
-                     :strict (set (keep (fn [[id st]] (when (= :sql (:kind st)) id)) (:steps flow)))}
+                     :step-ids (into (set (keys (:steps flow))) (mapcat :provides (vals (:steps flow))))
+                     :strict (set (mapcat (fn [[id st]] (when (#{:sql :proc} (:kind st)) (cons id (:provides st)))) (:steps flow)))}
               no-cache? (assoc :no-cache? true)
               trace (assoc :trace trace))
         run1 (fn [step env cancels] (run-step snapshot (:id flow) request-id env step env cancels))

@@ -121,7 +121,7 @@
 (def Step
   [:map {:closed true}
    [:id keyword?]
-   [:kind [:enum :sql :api :http]]
+   [:kind [:enum :sql :api :http :proc]]
    [:conn keyword?]
    [:doc {:optional true} string?]
    [:in {:optional true} [:map-of keyword? Path]]
@@ -138,7 +138,15 @@
    [:empty-on-404 {:optional true} boolean?]
    [:max-rows {:optional true} pos-int?]
    [:take {:optional true} [:or pos-int? [:vector any?]]]
-   [:tuning {:optional true} Defaults]])
+   [:tuning {:optional true} Defaults]
+   ;; :proc
+   [:call {:optional true} string?]
+   [:args {:optional true} [:vector [:or keyword? [:map {:closed true} [:out keyword?] [:type keyword?]
+                                                   [:inout {:optional true} boolean?]]]]]
+   [:results {:optional true} [:vector keyword?]]
+   [:status {:optional true} keyword?]
+   [:fail-on-status {:optional true} keyword?]
+   [:read-only {:optional true} boolean?]])
 
 (def Output
   [:schema {:registry

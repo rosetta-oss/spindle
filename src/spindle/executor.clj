@@ -68,7 +68,8 @@
                     code (or (:spindle/code (err/code-of root)) :internal)
                     st (steps id)]
                 (if (:optional st)
-                  (recur (assoc results id nil) (dissoc running id) (conj partial {:step id :code code})
+                  (recur (into (assoc results id nil) (map (fn [n] [n nil]) (:provides st)))
+                         (dissoc running id) (conj partial {:step id :code code})
                          (if-let [fb (:or-else st)] (conj skipped fb) skipped) wanted)
                   (do (cancel-running! (dissoc running id))
                       (throw (if (:spindle/code (ex-data root))
@@ -89,6 +90,10 @@
                   (contains? fallbacks id)
                   (let [primary (some (fn [[pid s]] (when (= id (:or-else s)) pid)) steps)]
                     (recur (assoc results id v primary v) running partial skipped wanted))
+
+                  ;; a :proc step with named result sets adds each set under its name
+                  (:spindle/sets v)
+                  (recur (merge (assoc results id (:spindle/self v)) (:spindle/sets v)) running partial skipped wanted)
 
                   :else
                   (let [skipped (if-let [fb (:or-else st)] (conj skipped fb) skipped)]

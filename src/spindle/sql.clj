@@ -200,3 +200,110 @@
       (finally
         (conn/evict! rt con)
         (try (.close con) (catch Throwable _ nil))))))
+
+;; ---------------------------------------------------------------------------
+;; stored procedures and functions (:proc)
+;; ---------------------------------------------------------------------------
+
+(def proc-types
+  {:integer java.sql.Types/INTEGER :bigint java.sql.Types/BIGINT :numeric java.sql.Types/NUMERIC
+   :decimal java.sql.Types/DECIMAL :double java.sql.Types/DOUBLE :varchar java.sql.Types/VARCHAR
+   :char java.sql.Types/CHAR :date java.sql.Types/DATE :timestamp java.sql.Types/TIMESTAMP
+   :boolean java.sql.Types/BOOLEAN :cursor java.sql.Types/REF_CURSOR :other java.sql.Types/OTHER})
+
+(defn call-text
+  "{call name(?,...)} or {? = call name(?,...)} with a return status. No statement
+   tag: drivers recognise the JDBC call escape only at the start of the text."
+  [{:keys [call args status]}]
+  (str "{" (when status "? = ") "call " call "(" (str/join "," (repeat (count args) "?")) ")}"))
+
+(defn- narrow
+  "Integers that fit are bound as int: databases pick a procedure or function by
+   argument types, and widen int → bigint/numeric themselves but never narrow
+   (PostgreSQL finds no f(bigint) for f(int))."
+  [v]
+  (if (and (instance? Long v) (<= Integer/MIN_VALUE (long v) Integer/MAX_VALUE)) (int v) v))
+
+(defn- out-value [v max-rows]
+  (if (instance? ResultSet v)
+    (with-open [^ResultSet rs v] (read-rows rs max-rows))
+    (cond (instance? Timestamp v) (.toLocalDateTime ^Timestamp v)
+          (instance? Date v) (.toLocalDate ^Date v)
+          :else v)))
+
+(defn- read-all-results
+  "Every result set a call produced, in order. Update counts are skipped."
+  [^java.sql.CallableStatement cs has-rs max-rows]
+  (loop [has-rs has-rs sets [] n 0]
+    (cond
+      (> n 64) (err/fail! :source_error "procedure produced more than 64 results")
+      has-rs (let [rows (with-open [rs (.getResultSet cs)] (read-rows rs max-rows))]
+               (recur (.getMoreResults cs) (conj sets rows) (inc n)))
+      (= -1 (.getUpdateCount cs)) sets
+      :else (recur (.getMoreResults cs) sets (inc n)))))
+
+(defn- proc-once!
+  [rt {:keys [args status max-rows id] :as step} values {:keys [tuning deadline-ns cancels tag]}]
+  (let [{:keys [ds]} rt
+        cancel-key (Object.)
+        cancelled (AtomicBoolean. false)
+        cursors? (some #(= :cursor (:type %)) (filter map? args))
+        ^Connection con (try (.getConnection ^javax.sql.DataSource ds)
+                             (catch Throwable t
+                               (err/fail! (if (= :timeout (classify t false)) :unavailable (classify t false))
+                                          "no database connection" {:step id :conn (:id rt)} t)))
+        broken (volatile! false)
+        off (if status 2 1)]
+    (try
+      ;; cursors (PostgreSQL refcursor) only live inside a transaction; it is rolled back afterwards
+      (when cursors? (.setAutoCommit con false))
+      (with-open [^java.sql.CallableStatement cs (.prepareCall con (call-text step))]
+        (when status (.registerOutParameter cs 1 java.sql.Types/INTEGER))
+        (doseq [[i a] (map-indexed vector args)
+                :let [idx (int (+ off i))]]
+          (if (map? a)
+            (do (when (:inout a) (bind! cs idx (narrow (get values (:out a)))))
+                (.registerOutParameter cs idx (int (proc-types (:type a)))))
+            (bind! cs idx (narrow (get values a)))))
+        (.setQueryTimeout cs (int (min (remaining-s deadline-ns)
+                                       (long (Math/ceil (/ (conn/parse-duration-ms (:timeout tuning) 30000) 1000.0))))))
+        (register-cancel! cancels cancel-key (fn [] (.set cancelled true) (try (.cancel cs) (catch Throwable _ nil))))
+        (try
+          (let [sets (read-all-results cs (.execute cs) max-rows)
+                outs (into {} (for [[i a] (map-indexed vector args) :when (map? a)]
+                                [(:out a) (out-value (.getObject cs (int (+ off i))) max-rows)]))
+                st (when status (let [v (.getObject cs 1)] (when v (long v))))]
+            {:sets sets :outs outs :status st})
+          (catch Throwable t
+            (vreset! broken (.get cancelled))
+            (let [code (classify t (.get cancelled))]
+              (err/fail! code (if (= code :timeout) "procedure cancelled or timed out" "procedure failed")
+                         {:step id :conn (:id rt)} t)))
+          (finally (deregister-cancel! cancels cancel-key))))
+      (finally
+        (when cursors? (try (.rollback con) (.setAutoCommit con true) (catch Throwable _ (vreset! broken true))))
+        (if @broken
+          (do (conn/evict! rt con) (try (.close con) (catch Throwable _ nil)))
+          (try (.close con) (catch Throwable _ nil)))))))
+
+(defn run-proc!
+  "Call a compiled :proc step. → rows, or {:spindle/sets {name rows} :spindle/self rows}
+   when the step names its result sets (:results) or has cursor OUT parameters.
+   The self row holds the return status and the scalar OUT values."
+  [rt {:keys [args results status fail-on-status] :as step} values ctx]
+  (let [{:keys [sets outs] st :status} (conn/guarded rt #(proc-once! rt step values (assoc ctx :tuning (:tuning step))))
+        cursor-outs (set (keep #(when (= :cursor (:type %)) (:out %)) (filter map? args)))
+        self (cond-> (apply dissoc outs cursor-outs) status (assoc status st))
+        named? (or (seq results) (seq cursor-outs))]
+    (when (and (= :non-zero fail-on-status) st (not (zero? st)))
+      (err/fail! :source_error (str "procedure returned status " st) {:step (:id step)}))
+    (when (> (count sets) (max 1 (count results)))
+      (err/fail! :source_error (str "procedure returned " (count sets) " result sets; the step names "
+                                    (count results) " (:results)") {:step (:id step)}))
+    (if named?
+      {:spindle/sets (merge (zipmap results (concat sets (repeat [])))
+                            (select-keys outs cursor-outs))
+       :spindle/self (if (seq self) [self] [])}
+      (cond (seq sets) (first sets)
+            (seq self) [self]
+            :else []))))
