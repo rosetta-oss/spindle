@@ -1,0 +1,22 @@
+{:doc    "Order with lines (SQL), current stock per product (HTTP API), line totals (SCI)."
+ :params [:map [:order_id pos-int?]]
+ :steps
+ [{:id :order :kind :sql :conn :aw :in {:order_id [:params :order_id]}}
+  {:id :lines :kind :sql :conn :aw :in {:order_id [:order :order_id]}}
+  {:id :stock :kind :http :conn :erp_api :optional true
+   :request {:method :get :path "/inventory"
+             :query {"product_id" [:lines :productid]}}
+   :rows "$[*]"}]
+ :output
+ {:from :order
+  :one? true
+  :types {:orderdate :date :totaldue :decimal-string}
+  :nest {:lines {:from :lines :on {:order_id :order_id}
+                 :merge {:from :stock :on {:productid :product_id}
+                         :select [:on_hand :safety_stock_level]}
+                 :compute {:line_total (round-half-up (* orderqty unitprice (- 1 unitpricediscount)) 2)
+                           :low_stock  (and on_hand (< on_hand safety_stock_level))}
+                 :types {:unitprice :decimal-string :line_total :decimal-string}}}}
+ :cache  {:ttl "1m" :stale "5m"}
+ :limits {:timeout "5s"}
+ :endpoint {:path "/api/sales/orders/{order_id}/with-stock" :scopes #{"sales:read"}}}

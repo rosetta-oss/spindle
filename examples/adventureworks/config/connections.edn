@@ -1,0 +1,17 @@
+;; AdventureWorks (PostgreSQL port) + its PostgREST API. Secrets come from the environment.
+{:aw      {:type :sql
+           :dialect :postgres
+           :jdbc-url "jdbc:postgresql://${AW_DB_HOST}:${AW_DB_PORT}/adventureworks"
+           :username "${AW_DB_USER}"
+           :password "${AW_DB_PASSWORD}"
+           :zone "UTC"
+           :pool {:max 6 :min-idle 1}
+           :defaults {:timeout "3s" :isolation :read-committed :fetch-size 500}
+           :guard {:concurrency 4 :queue-wait "500ms" :rate "200/s"
+                   :breaker {:failure-ratio [10 20] :open "30s" :half-open-calls 3}}}
+ :erp_api {:type :http
+           :base-url "${ERP_API_URL}"
+           :auth {:header "Authorization" :value "Bearer ${ERP_API_TOKEN}"}
+           :list-style :postgrest-in
+           :defaults {:timeout "2s"}
+           :guard {:concurrency 8 :rate "100/s" :breaker {:failure-ratio [5 10] :open "20s"}}}}

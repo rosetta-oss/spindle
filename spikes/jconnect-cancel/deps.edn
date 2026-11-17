@@ -1,0 +1,5 @@
+;; Run from this directory:  clojure -M -m jconnect-cancel
+;; jConnect is not bundled: put jconn4.jar into ../../drivers/ first.
+{:paths ["src"]
+ :deps {spindle/spindle {:local/root "../.."}
+        sap/jconnect {:local/root "../../drivers/jconn4.jar"}}}

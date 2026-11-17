@@ -1,0 +1,3 @@
+;; API keys are stored as SHA-256 hashes. Generate a key and its hash with:
+;;   KEY=$(openssl rand -hex 24); printf %s "$KEY" | shasum -a 256
+{:api-keys [{:id "demo" :sha256 "${SPINDLE_DEMO_KEY_SHA256}" :scopes #{"sales:read" "spindle:admin"}}]}

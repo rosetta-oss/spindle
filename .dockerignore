@@ -1,0 +1,5 @@
+.cpcache
+target
+.git
+spikes
+drivers/*.jar

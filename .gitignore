@@ -1,0 +1,12 @@
+.cpcache/
+.nrepl-port
+target/
+.lsp/
+.clj-kondo/.cache/
+*.jar
+!drivers/README.md
+drivers/*
+!drivers/README.md
+.env
+secrets/
+*.log

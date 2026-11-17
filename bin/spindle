@@ -1,0 +1,13 @@
+#!/bin/sh
+# Start Spindle with drivers/*.jar on the classpath (drivers Spindle does not bundle).
+# Usage: bin/spindle            (uses target/spindle.jar, or `clojure -M:run` when not built)
+here=$(cd "$(dirname "$0")/.." && pwd)
+cp="$here/target/spindle.jar"
+for j in "$here"/drivers/*.jar; do [ -f "$j" ] && cp="$cp:$j"; done
+if [ -f "$here/target/spindle.jar" ]; then
+  exec java ${JAVA_OPTS:-} -cp "$cp" spindle.main
+else
+  extra=""
+  for j in "$here"/drivers/*.jar; do [ -f "$j" ] && extra="$extra\"$j\" "; done
+  cd "$here" && exec clojure -Sdeps "{:paths [\"src\" \"resources\" $extra]}" -M:run
+fi

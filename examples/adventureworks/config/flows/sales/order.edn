@@ -1,0 +1,7 @@
+{:doc    "Sales order headers by id (batch-capable: id=43659,43660)."
+ :params [:map [:order_id [:vector {:min 1 :max 500} pos-int?]]]
+ :steps  [{:id :order :kind :sql :conn :aw :in {:order_id [:params :order_id]}}]
+ :output {:from :order :types {:orderdate :date :totaldue :decimal-string}}
+ :cache  {:ttl "5m" :stale "30m"}
+ :limits {:timeout "3s"}
+ :endpoint {:path "/api/sales/orders" :scopes #{"sales:read"} :batch {:key :order_id}}}
