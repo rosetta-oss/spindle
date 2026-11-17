@@ -219,6 +219,58 @@ per caller, so one user's rows are never served to another.
 - Callers with scope `spindle:trace` can add `?trace=true` to see, per step, its kind, connection, time, rows,
   cache state and whether it was skipped.
 
+## 8c. Stored procedures and functions (`:proc`)
+
+```clojure
+{:id :bom :kind :proc :conn :erp :read-only true
+ :call "dbo.usp_bom"                                   ; a plain name; Spindle builds {call …}
+ :args [:product_id :as_of {:out :row_count :type :integer}]   ; in order: inputs from :in, OUT parameters
+ :in {:product_id [:params :id] :as_of [:params :as_of]}
+ :status :status :fail-on-status :non-zero             ; {? = call …}; non-zero fails the request
+ :results [:header :components]}                       ; result sets, in order → named row sets
+```
+
+- Later steps and the output read `:header` and `:components` like steps; the step's own id holds one row with the
+  status and the OUT values. Without `:results`, the step returns its only result set (or that one row).
+- An undeclared extra result set is an error; a missing one is empty. Every result set has the row cap.
+- OUT type `:cursor` (PostgreSQL refcursor) is read as a named row set too.
+- **PostgreSQL:** a set-returning function is simplest as `:sql` (`select * from f(:id)`); a `CREATE PROCEDURE`
+  needs `:procedure true` (native `CALL`; OUT values come back as its row).
+- A procedure counts as a write unless `:read-only true`; writing procedures belong in mutation endpoints.
+
+## 8d. Writes (mutation endpoints)
+
+```clojure
+{:spindle/format 1
+ :params [:map [:id pos-int?] [:comment [:string {:max 128}]]]
+ :steps [{:id :upd :kind :sql :conn :erp :expect {:rows 1}
+          :in {:id [:params :id] :comment [:params :comment]}}
+         {:id :order :kind :sql :conn :erp :after [:upd] :in {:id [:params :id]}}]
+ :output {:from :order :one? true}
+ :endpoint {:path "/orders/{id}/comment" :method :put :mutation true :scopes #{"orders:write"}
+            :idempotency {:conn :erp :table "spindle_idempotency"}
+            :audit {:conn :erp :table "spindle_audit"}
+            :evicts ["orders"]}}
+```
+
+- All SQL and `:proc` steps on one connection share **one transaction**; reads in it see the writes. Commit happens
+  after every step and the output succeeded; anything else rolls back. Responses and errors say
+  `outcome`: `committed`, `rolled_back`, or `partial` (a later connection's commit failed; avoid writing to two).
+- `:expect {:rows n}`: another count rolls back with 404 (none) or 409.
+- `:after [:step]` orders steps that no data path links (a read-back after a write).
+- `Idempotency-Key`: stored with the response in the same transaction; a repeat returns it, a different request
+  with the same key is 409. The tables' DDL is in `src/spindle/mutation.clj`; Spindle never creates tables.
+- Never cached, never `:optional`, no `:parallel` on the written connection. HTTP writes (PUT/PATCH/DELETE) cannot
+  be rolled back: put them last, or make the upstream idempotent.
+- A trial run (MCP `test_run`) of a mutation flow always rolls back.
+
+## 8e. Many calls at once
+
+- **Fan-out:** `{:fan-out [:lines :productid] :concurrency 4}` calls the API once per value, up to 4 at once, results
+  in order. The connection's `:guard {:concurrency n}` still bounds calls across all requests.
+- **Long `IN` lists:** chunks (ASE 250, PostgreSQL 1000, or `:tuning {:max-in n}`) run in parallel when the flow sets
+  `:parallel {:erp 2}`; by default one statement per connection per request.
+
 ## 9. Raw search results merged with SQL and API (*roadmap*: `:search`)
 
 ```clojure

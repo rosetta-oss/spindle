@@ -24,6 +24,7 @@ Licence: **EPL-2.0**. Open source.
 | D14 | Elasticsearch/OpenSearch is supported through a `:search` step over HTTP, not JDBC (§5.6, planned after the PostgreSQL main line). |
 | D15 | Development and integration tests run on PostgreSQL AdventureWorks, MySQL 8.4 and ClickHouse 26 containers. ASE is tested only on the company test server. |
 | D16 | 2026-11-17 review of the instruction set: flow maps are closed (typos are load errors); `:spindle/format 1`; one `[:op …]` language for `:when`, `:derive` and `:assert` (the map `:when` form stays accepted); `:views` publish several projections of one set of steps; `:merge` with several matches is an error unless `:pick :first`; a path to a column no SQL row has is an error; row-cap precedence is step > flow `:limits` > connection; a step skipped for empty input returns its `:default`. |
+| D17 | 2026-11-17 built on PostgreSQL: `:proc` (ordered `:args`, OUT, status, named result sets and cursors; integers that fit are bound as int so overloads resolve; PostgreSQL procedures via native CALL with `:procedure true`; no statement tag on calls); writes (one transaction per connection, `:expect`, `:after`, idempotency record in the same transaction, audit line and table, `:evicts`; trial runs roll back); JWT via nimbus-jose-jwt; parallel fan-out and IN chunks. |
 
 ## First release (scope agreed 2026-11-17)
 

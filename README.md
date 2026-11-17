@@ -17,7 +17,7 @@ cacheable APIs in front of legacy databases (Sybase ASE) and heavy upstream APIs
 - Design: [docs/design/0001-spindle-design.md](docs/design/0001-spindle-design.md). The section "First release" covers the current scope.
 - Patterns: [docs/guides/cookbook.md](docs/guides/cookbook.md).
 
-## Status: first release in progress
+## Status
 
 **Target:** one real Semalith graph fetches through Spindle, with fewer upstream calls, lower p95 latency and fewer ASE lock waits.
 
@@ -25,7 +25,10 @@ cacheable APIs in front of legacy databases (Sybase ASE) and heavy upstream APIs
 |---|---|
 | `:sql` steps; `IN` lists expanded and chunked; SQL runs exactly as written | ✅ |
 | `:api` steps (`:http` alias): data-path path/query/body/headers, list styles, per-key fan-out | ✅ |
-| `:when` conditions (`:exists :empty := :all :any :not`), stable `:default` for skipped steps | ✅ |
+| `:when` conditions in the `[:op …]` language (`[:exists p] [:= p v] [:> p v] [:all …]`; map form still loads), stable `:default` for skipped steps | ✅ |
+| Strict loading: closed flow/step/output/endpoint maps, `:spindle/format 1`, missing-column and multi-match `:merge` errors | ✅ |
+| Result stage: `:derive` and `:assert` (`[:op …]`), `:on-fail :flag\|:error`, `?trace=true` (scope `spindle:trace`) | ✅ |
+| `:views`: several projections of one set of steps, each running only what it reads | ✅ |
 | Projection: several endpoints share one heavy upstream call (step cache stores the body; `:rows` applied after) | ✅ |
 | Step cache: TTL per step, single-flight, stale-while-revalidate, stale on failure, `:per :caller`, tags, weight bound | ✅ |
 | Circuit breaker (diehard), bulkhead, rate limit per connection; deadline → `Statement.cancel` | ✅ (PostgreSQL verified) |
@@ -34,18 +37,20 @@ cacheable APIs in front of legacy databases (Sybase ASE) and heavy upstream APIs
 | Hot reload: validate everything, atomic swap, pool carry-over/retire, rollback + pin | ✅ |
 | API keys with scopes; `/metrics`, `/health/live`, `/health/ready`, `/status` (incl. per-step cache hit counts) | ✅ |
 | **Sybase ASE dialect: cancel, timeout, showplan explain** | ⚠️ written; **needs the company ASE**: run `spikes/jconnect-cancel` |
-| Dedicated batch route, keyset paging, OpenAPI, slow-query log | ⏳ next |
+| Batch route `POST /api/_batch/<id>` (cached per key), keyset paging (`:page`), `GET /openapi.json`, slow-step log | ✅ |
+| `:proc` steps: OUT parameters, return status, named result sets, cursors; PostgreSQL procedures via `:procedure true` | ✅ (PostgreSQL verified; ASE needs the company server) |
+| Writes: `:mutation true` endpoints, one transaction per connection, `:expect`, `:after`, `Idempotency-Key`, audit, `:evicts` | ✅ (PostgreSQL verified) |
+| JWT bearer tokens from configured issuers (JWKS) next to API keys | ✅ |
+| Parallelism: independent steps overlap; `:fan-out` up to `:concurrency`; `IN` chunks in parallel with `:parallel` | ✅ |
 
-**Roadmap after the first release**, in order:
+**Still open**, in order:
 
-1. stored procedures (`:proc`);
-2. Elasticsearch/OpenSearch (`:search`);
-3. SCI expressions (already in the code, but outside the first release's guarantees);
-4. authoring MCP for agents;
-5. writes;
-6. JWT;
-7. DAG parallelism;
-8. MySQL and ClickHouse. The dialects exist and their read, timeout and cancel tests pass, but they are on hold until needed.
+1. Elasticsearch/OpenSearch (`:search`);
+2. composite keys in data paths (`[:lines [:order_id :line_no]]`), expressions as `:in` values, `:examples` with expected results;
+3. SCI expressions (in the code, outside the guarantees; prefer `:derive`);
+4. MySQL and ClickHouse: the dialects exist and their read, timeout and cancel tests pass, but they are on hold until needed.
+
+Authoring MCP, `:proc`, writes, JWT and parallelism are done; ASE behaviour of `:proc` and writes still needs the company server.
 
 ## Requirements
 
@@ -77,6 +82,7 @@ Integration tests run only when their environment variables are set:
 | PostgreSQL (AdventureWorks) + its PostgREST API | `AW_DB_HOST AW_DB_PORT AW_DB_USER AW_DB_PASSWORD` and optionally `ERP_API_URL ERP_API_TOKEN` |
 | MySQL (on hold) | `SPINDLE_IT_MYSQL_URL SPINDLE_IT_MYSQL_USER SPINDLE_IT_MYSQL_PASSWORD` (MariaDB driver + MySQL 8: add `?allowPublicKeyRetrieval=true`) |
 | ClickHouse (on hold) | `SPINDLE_IT_CH_URL SPINDLE_IT_CH_USER SPINDLE_IT_CH_PASSWORD` |
+| PostgreSQL, read-write (`:proc`, writes, parallel chunks): **a throwaway database**, schema `spindle_it` is dropped and recreated | `SPINDLE_IT_PG_URL SPINDLE_IT_PG_USER SPINDLE_IT_PG_PASSWORD` |
 
 AdventureWorks is Microsoft's MIT-licensed sample database (PostgreSQL port: `lorint/AdventureWorks-for-Postgres`).
 The examples in `examples/adventureworks/config/` use it.
@@ -190,6 +196,7 @@ SPINDLE_CONFIG_DIR=config bin/spindle                   # adds drivers/*.jar
 | `SPINDLE_STEP_CACHE_MB` | `256` | step-cache weight bound per node |
 | `SPINDLE_DB` | `data/spindle.db` | token store (SQLite); must not be inside the config directory |
 | `SPINDLE_TRUST_FORWARDED_PROTO` | `true` | trust `X-Forwarded-Proto: https` from the reverse proxy |
+| `SPINDLE_SLOW_MS` | `1000` | slow-step threshold (logger `spindle.slow`); per step or connection: `:tuning :slow` |
 
 **Operations:**
 
@@ -249,10 +256,12 @@ Source files in `src/spindle/`:
 | Area | Files |
 |---|---|
 | Configuration | `config.clj` (load, validate, snapshot, reload), `explain.clj` (mandatory explain archive) |
-| Flows | `flow.clj` (compile and run, `:when`, step cache use), `executor.clj` (DAG scheduler: promesa + virtual threads) |
-| Steps | `sql.clj`, `httpstep.clj`, `stepcache.clj` |
-| Output | `output.clj` (projection and merge), `expr.clj` (SCI, roadmap) |
-| Infrastructure | `conn.clj` (pools and guards), `dialect.clj`, `auth.clj` (keys and identity), `server.clj`, `metrics.clj` |
+| Flows | `flow.clj` (compile and run, `:when`, `:views`, step cache use), `executor.clj` (DAG scheduler: promesa + virtual threads), `par.clj` |
+| Steps | `sql.clj` (`:sql`, `:proc`), `httpstep.clj`, `stepcache.clj` |
+| Result | `output.clj` (merge, nest, select), `result.clj` (`[:op …]` derive, assert, conditions), `expr.clj` (SCI) |
+| Writes | `tx.clj` (one transaction per connection), `mutation.clj` (idempotency, audit, eviction) |
+| HTTP | `server.clj` (endpoints, batch, paging, trace), `openapi.clj`, `jsonout.clj` |
+| Infrastructure | `conn.clj` (pools and guards), `dialect.clj`, `auth.clj` (keys and identity), `jwt.clj`, `metrics.clj` |
 
 **Rules:**
 

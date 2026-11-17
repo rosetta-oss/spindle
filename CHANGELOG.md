@@ -13,6 +13,15 @@
 - **Dialects:** postgres, mysql, clickhouse (read, timeout and cancel verified), sybase-ase (not yet verified).
 - **Examples and tests:** AdventureWorks example config; integration tests for PostgreSQL, MySQL and ClickHouse.
 - **jConnect:** cancellation test in `spikes/jconnect-cancel`.
+- **Instruction set (review 2026-11-17):** closed schemas and `:spindle/format 1`; one `[:op …]` language for `:when`,
+  `:derive` and `:assert`; `:views`; `:after`; strict missing-column and `:merge` checks; row-cap precedence fixed;
+  executor fixes for `:optional` + `:or-else` and fallback dependencies.
+- **Result stage:** `:derive`, `:assert` with `:on-fail`, `?trace=true`.
+- **Read path:** batch route `POST /api/_batch/<id>`, keyset paging, `GET /openapi.json`, slow-step log.
+- **`:proc` steps:** OUT parameters, return status, named result sets, cursors; PostgreSQL procedures via native CALL.
+- **Writes:** mutation endpoints with one transaction per connection, `:expect`, `Idempotency-Key`, audit, `:evicts`.
+- **Auth:** JWT bearer tokens from configured issuers (nimbus-jose-jwt).
+- **Parallelism:** fan-out up to `:concurrency`; parallel `IN` chunks with `:parallel`.
 
 ### First-release scope (agreed 2026-11-17)
 
