@@ -85,6 +85,18 @@
     (when (<= ms 0) (err/fail! :timeout "deadline passed before statement"))
     (max 1 (long (Math/ceil (/ ms 1000.0))))))
 
+(defn- bind!
+  "Bind one parameter. Most drivers accept setObject(i, null); jConnect refuses it
+   (JZ0SE), so NULL then goes through setNull as VARCHAR. Not the driver's
+   parameter metadata: ASE guesses INT for e.g. isnull(?, '19000101'), which
+   then fails converting the fallback string."
+  [^PreparedStatement ps ^long i v]
+  (if (nil? v)
+    (try (.setObject ps (int i) nil)
+         (catch java.sql.SQLException _
+           (.setNull ps (int i) java.sql.Types/VARCHAR)))
+    (.setObject ps (int i) v)))
+
 (defn- run-one!
   [rt ^String sql-text args {:keys [tuning deadline-ns cancels step-id tag max-rows]}]
   (let [{:keys [ds] d :dialect} rt
@@ -101,7 +113,7 @@
           (when (:isolation? d) (.setTransactionIsolation con (int (dialect/isolation-levels iso)))))
         (with-open [^PreparedStatement ps (.prepareStatement con text)]
           (doseq [[i v] (map-indexed vector args)]
-            (.setObject ps (int (inc i)) v))
+            (bind! ps (inc i) v))
           (.setQueryTimeout ps (int (min (remaining-s deadline-ns)
                                          (long (Math/ceil (/ (conn/parse-duration-ms (:timeout tuning) 30000) 1000.0))))))
           (when max-rows (.setMaxRows ps (int (inc max-rows))))
@@ -154,7 +166,7 @@
         (fn? ex)
         (with-open [^PreparedStatement ps (.prepareStatement con (ex sql-text))]
           (.setQueryTimeout ps 10)
-          (doseq [[i v] (map-indexed vector args)] (.setObject ps (int (inc i)) v))
+          (doseq [[i v] (map-indexed vector args)] (bind! ps (inc i) v))
           (with-open [rs (.executeQuery ps)] (read-rows rs 10000)))
 
         (= :showplan ex)
@@ -171,7 +183,7 @@
           (let [^PreparedStatement ps (.prepareStatement con sql-text)
                 text (try
                        (.setQueryTimeout ps 10)
-                       (doseq [[i v] (map-indexed vector args)] (.setObject ps (int (inc i)) v))
+                       (doseq [[i v] (map-indexed vector args)] (bind! ps (inc i) v))
                        (try (quiet #(.execute ps)) (catch SQLException _ nil))
                        (str (warnings-text (.getWarnings ps)) "\n" (warnings-text (.getWarnings con)))
                        (finally (quiet #(.close ps))))]

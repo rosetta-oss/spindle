@@ -116,3 +116,9 @@
       (let [steps {:p {:deps #{} :conn :db :or-else :f} :f {:deps #{} :conn :db} :use {:deps #{:p} :conn :db}}
             {:keys [results]} (executor/run steps (fake-run {:p {:rows []} :f {:rows [{:from :archive}]}}) {:deadline-ns (dl 2000)})]
         (is (= [{:from :archive}] (:p results)))))))
+
+(deftest params-schema-defaults
+  (let [schema [:map [:id pos-int?]
+                [:from {:optional true :default "1900-01-01"} :string]]]
+    (is (= {:id 7 :from "1900-01-01"} (spindle.flow/coerce-params schema {:id "7"})))
+    (is (= {:id 7 :from "2026-11-10"} (spindle.flow/coerce-params schema {:id "7" :from "2026-11-10"})))))

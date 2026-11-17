@@ -113,3 +113,10 @@
          (spindle.mcp/json-safe {:at (java.time.LocalDateTime/of 2026 11 13 18 31 37)
                                  :d (java.time.LocalDate/of 2026 11 13)
                                  :rows [{:t (java.time.LocalTime/of 12 30)}] :n 1}))))
+
+(deftest optional-param-binds-null
+  (let [edn (pr-str {:params [:map [:x {:optional true} :string]]
+                     :steps [{:id :s :kind :sql :conn :shop :skip-when-empty false
+                              :sql "select coalesce(:x, 'none') as v" :in {:x [:params :x]}}]})]
+    (is (= [{:v "none"}] (:output (data (call "test_run" {:id "scratch/opt" :edn edn :params {}})))))
+    (is (= [{:v "given"}] (:output (data (call "test_run" {:id "scratch/opt" :edn edn :params {:x "given"}})))))))

@@ -206,7 +206,7 @@
 (defn coerce-params
   "Raw request params → params decoded and validated against the flow schema." [schema raw]
   (let [raw (split-lists schema raw)
-        v (m/decode schema raw (mt/transformer mt/string-transformer mt/strip-extra-keys-transformer))]
+        v (m/decode schema raw (mt/transformer (mt/default-value-transformer {::mt/add-optional-keys true}) mt/string-transformer mt/strip-extra-keys-transformer))]
     (if (m/validate schema v)
       v
       (err/fail! :input_rejected (str "invalid parameters: "
