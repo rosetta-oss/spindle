@@ -14,6 +14,7 @@
             [spindle.conn :as conn]
             [spindle.error :as err]
             [spindle.flow :as flow]
+            [spindle.mcp :as mcp]
             [spindle.metrics :as metrics]
             [spindle.stepcache :as stepcache]
             [spindle.tokens :as tokens]
@@ -240,7 +241,7 @@
        :body (io/input-stream res)}
       (json-resp 404 {:error {:code "not_found"}}))))
 
-(defn handler [{:keys [node-id config-dir store]}]
+(defn- handler* [{:keys [node-id config-dir store]} mcp-handler]
   (fn [req]
     (let [request-id (str (UUID/randomUUID))
           uri (:uri req)
@@ -261,6 +262,11 @@
           (if (web/secure? req) (console-resp uri) (web/insecure-resp))
 
           (and (str/starts-with? uri "/admin/tokens") (not (web/secure? req))) (web/insecure-resp)
+
+          (or (= uri "/mcp") (str/starts-with? uri "/mcp/"))
+          (if (web/secure? req)
+            (or (mcp-handler req) (json-resp 404 {:error {:code "not_found"}}))
+            (web/insecure-resp))
 
           (str/starts-with? uri "/admin/")
           (if-not (admin? snap store req)
@@ -296,6 +302,9 @@
                     (finally (.decrementAndGet inflight))))))
             (json-resp 404 {:error {:code "not_found" :message "no such endpoint"}})))
         (catch Throwable e (error-resp e request-id))))))
+
+(defn handler [opts]
+  (handler* opts (mcp/handler opts)))
 
 (defn start! [{:keys [port] :as opts}]
   (register-gauges!)
