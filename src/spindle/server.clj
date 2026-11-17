@@ -251,34 +251,44 @@
 
 (defn- bad-request [msg] (json-resp 400 {:error {:code "bad_request" :message msg}}))
 
+(defn- conflict-resp [] (json-resp 409 {:error {:code "conflict" :message "id already in use"}}))
+
 (defn- read-json-body [req]
   (try
     (let [s (if (:body req) (slurp (:body req)) "")]
       (if (str/blank? s) {} (json/read-value s read-mapper)))
     (catch Exception _ ::invalid)))
 
-(defn- issue-token [snap store req]
+(defn- issue-token [snap store caller req]
   (let [body (read-json-body req)
         {:keys [id scopes expires_at]} (when (map? body) body)
-        caller (:id (auth/authenticate (:auth snap) store req))]
+        by (:id caller)]
     (cond
       (not (map? body)) (bad-request "invalid JSON body")
       (not (and (string? id) (re-matches token-id-re id))) (bad-request "id must match ^[a-z0-9][a-z0-9._-]{1,62}$")
       (not (and (sequential? scopes) (seq scopes) (every? string? scopes))) (bad-request "scopes must be a non-empty list of strings")
       (not (or (nil? expires_at) (string? expires_at))) (bad-request "expires_at must be an ISO-8601 instant")
-      (some #(= id (:id %)) (get-in snap [:auth :keys])) (json-resp 409 {:error {:code "conflict" :message "id already in use"}})
+      (some #(= id (:id %)) (get-in snap [:auth :keys])) (conflict-resp)
       :else
       (try
-        (let [r (tokens/issue! store {:id id :scopes (vec scopes) :expires-at expires_at :created-by caller})]
-          (log/info (str "event=token-issued id=" id " by=" caller))
+        (let [r (tokens/issue! store {:id id :scopes (vec scopes) :expires-at expires_at :created-by by})]
+          (log/info (str "event=token-issued id=" id " by=" by))
           (json-resp 201 (select-keys r [:id :token :scopes :expires_at])))
         (catch clojure.lang.ExceptionInfo e
           (if (:conflict (ex-data e))
-            (json-resp 409 {:error {:code "conflict" :message "id already in use"}})
+            (conflict-resp)
             (throw e)))
         (catch java.time.DateTimeException _ (bad-request "expires_at must be an ISO-8601 instant"))))))
 
-(defn- token-admin [snap store req]
+(defn- tokens-uri?
+  "Exactly /admin/tokens or below it: /admin/tokensX is not the token API."
+  [uri]
+  (or (= uri "/admin/tokens") (str/starts-with? uri "/admin/tokens/")))
+
+(defn- token-admin
+  "`caller` is the admin already authenticated by the router (authenticated once
+   per request: a store lookup can touch the token row)."
+  [snap store caller req]
   (let [uri (:uri req) method (:request-method req)]
     (cond
       (and (= uri "/admin/tokens") (= method :get))
@@ -287,13 +297,13 @@
                                          (get-in snap [:auth :keys]))
                       :admin_scope (get-in snap [:auth :admin-scope] "spindle:admin")})
 
-      (and (= uri "/admin/tokens") (= method :post)) (issue-token snap store req)
+      (and (= uri "/admin/tokens") (= method :post)) (issue-token snap store caller req)
 
       (and (= method :delete) (str/starts-with? uri "/admin/tokens/"))
       (let [id (try (java.net.URLDecoder/decode (subs uri (count "/admin/tokens/")) "UTF-8")
                     (catch IllegalArgumentException _ nil))]
         (if (and id (re-matches token-id-re id) (tokens/revoke! store id))
-          (do (log/info (str "event=token-revoked id=" id " by=" (:id (auth/authenticate (:auth snap) store req))))
+          (do (log/info (str "event=token-revoked id=" id " by=" (:id caller)))
               (json-resp 200 {:revoked true}))
           (json-resp 404 {:error {:code "not_found" :message "no such live token"}})))
 
@@ -315,7 +325,8 @@
     (if res
       {:status 200
        :headers {"Content-Type" (console-types ext)
-                 "Content-Security-Policy" "default-src 'self'"
+                 ;; default-src does not cover framing: refuse it explicitly (clickjacking)
+                 "Content-Security-Policy" "default-src 'self'; frame-ancestors 'none'"
                  "Cache-Control" "no-store"
                  "X-Content-Type-Options" "nosniff"}
        :body (io/input-stream res)}
@@ -361,7 +372,7 @@
           (or (= uri "/console") (str/starts-with? uri "/console/"))
           (if (web/secure? req) (console-resp uri) (web/insecure-resp))
 
-          (and (or (str/starts-with? uri "/admin/tokens") (= uri "/admin/activity")) (not (web/secure? req))) (web/insecure-resp)
+          (and (or (tokens-uri? uri) (= uri "/admin/activity")) (not (web/secure? req))) (web/insecure-resp)
 
           (or (= uri "/mcp") (str/starts-with? uri "/mcp/"))
           (if (web/secure? req)
@@ -369,20 +380,21 @@
             (web/insecure-resp))
 
           (str/starts-with? uri "/admin/")
-          (if-not (admin? snap store req)
-            (json-resp 403 {:error {:code "forbidden" :message "admin scope required"}})
-            (case (if (or (= uri "/admin/tokens") (str/starts-with? uri "/admin/tokens/")) :tokens [(:request-method req) uri])
-              :tokens (if store (token-admin snap store req) (json-resp 404 {:error {:code "not_found"}}))
-              [:post "/admin/reload"] (let [r (config/with-write-lock (config/reload! config-dir))] (register-gauges!) (json-resp (if (:ok r) 200 422) r))
-              [:post "/admin/config/rollback"]
-              (let [v (get (query-string-params req) "to")
-                    r (config/with-write-lock (config/rollback! v))] (json-resp (if (:ok r) 200 422) r))
-              [:get "/admin/activity"] (json-resp 200 (activity/snapshot))
-              [:post "/admin/config/unpin"] (do (config/unpin!) (json-resp 200 {:pinned false}))
-              [:post "/admin/cache/evict"]
-              (let [tags (remove str/blank? (str/split (str (get (query-string-params req) "tag")) #","))]
-                (json-resp 200 {:evicted (stepcache/evict-tags! tags)}))
-              (json-resp 404 {:error {:code "not_found"}})))
+          (let [caller (auth/authenticate (:auth snap) store req)]
+            (if-not (auth/allowed? caller #{(get-in snap [:auth :admin-scope] "spindle:admin")})
+              (json-resp 403 {:error {:code "forbidden" :message "admin scope required"}})
+              (case (if (tokens-uri? uri) :tokens [(:request-method req) uri])
+                :tokens (if store (token-admin snap store caller req) (json-resp 404 {:error {:code "not_found"}}))
+                [:post "/admin/reload"] (let [r (config/with-write-lock (config/reload! config-dir))] (register-gauges!) (json-resp (if (:ok r) 200 422) r))
+                [:post "/admin/config/rollback"]
+                (let [v (get (query-string-params req) "to")
+                      r (config/with-write-lock (config/rollback! v))] (json-resp (if (:ok r) 200 422) r))
+                [:get "/admin/activity"] (json-resp 200 (activity/snapshot))
+                [:post "/admin/config/unpin"] (do (config/unpin!) (json-resp 200 {:pinned false}))
+                [:post "/admin/cache/evict"]
+                (let [tags (remove str/blank? (str/split (str (get (query-string-params req) "tag")) #","))]
+                  (json-resp 200 {:evicted (stepcache/evict-tags! tags)}))
+                (json-resp 404 {:error {:code "not_found"}}))))
 
           (= uri "/openapi.json")
           (if (auth/authenticate (:auth snap) store req)

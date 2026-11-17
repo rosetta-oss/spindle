@@ -58,13 +58,12 @@
                (.getErrorCode e))]
     (= 19 (bit-and (long code) 0xff))))
 
-(defn- fetch-live [ds h now]
+(defn- fetch-live [ds h]
   (when-let [row (jdbc/execute-one! ds ["select id, scopes, expires_at from tokens where sha256 = ? and revoked_at is null" h]
                                     {:builder-fn rs/as-unqualified-maps})]
     {:id (:id row)
      :scopes (set (json/read-value (:scopes row)))
-     :exp-ms (parse-ms (:expires_at row))
-     :now now}))
+     :exp-ms (parse-ms (:expires_at row))}))
 
 (defn open-sqlite
   "Opens (creating if needed) the token DB at path. Refuses a path inside config-dir.
@@ -84,7 +83,7 @@
                    (.ticker ticker)
                    (.build))
          touched (ConcurrentHashMap.)
-         load (fn [h] (or (fetch-live ds h (now-ms)) ::none))
+         load (fn [h] (or (fetch-live ds h) ::none))
          touch! (fn [id now]
                   (let [prev (.get touched id)]
                     (when (or (nil? prev) (>= (- now (long prev)) touch-ms))

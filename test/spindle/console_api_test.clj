@@ -136,6 +136,8 @@
   (let [{:keys [h admin]} (setup)]
     (is (= 201 (:status (call h :post "/admin/tokens" admin :body {:id "rv-1" :scopes ["x"]}))))
     (is (= 404 (:status (call h :delete "/admin/tokensX" admin))))
+    (is (= 404 (:status (call h :get "/admin/tokensX" admin :remote "10.0.0.5")))
+        "only /admin/tokens and below get the token API's HTTPS rule")
     (is (= 404 (:status (call h :delete "/admin/tokens/Bad%20Id" admin))))
     (is (= 200 (:status (call h :delete "/admin/tokens/rv%2D1" admin))))))
 

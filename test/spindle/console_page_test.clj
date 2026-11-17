@@ -11,7 +11,8 @@
     (let [r (get* uri)]
       (is (= 200 (:status r)))
       (is (re-find #"text/html" (get-in r [:headers "Content-Type"])))
-      (is (= "default-src 'self'" (get-in r [:headers "Content-Security-Policy"])))
+      (is (= "default-src 'self'; frame-ancestors 'none'" (get-in r [:headers "Content-Security-Policy"])))
+      (is (= "nosniff" (get-in r [:headers "X-Content-Type-Options"])))
       (is (= "no-store" (get-in r [:headers "Cache-Control"]))))))
 
 (deftest index-has-no-inline-script
