@@ -7,6 +7,7 @@
             [next.jdbc :as jdbc]
             [spindle.auth :as auth]
             [spindle.config :as config]
+            [spindle.explain]
             [spindle.server :as server]))
 
 (def ^:dynamic *dir* nil)
@@ -19,7 +20,7 @@
 (defn- base-config [dir db]
   (write! dir "connections.edn"
           (pr-str {:shop {:type :sql :dialect :sqlite :jdbc-url (str "jdbc:sqlite:" db)
-                          :pool {:max 2} :defaults {:timeout "2s"}
+                          :pool {:max 2} :defaults {:timeout "2s" :max-rows 1000}
                           :guard {:concurrency 2 :breaker {:failure-ratio [3 5] :open "1s"}}}}))
   (write! dir "auth.edn" (pr-str {:api-keys [{:id "t" :sha256 (auth/sha256-hex api-key) :scopes #{"shop:read" "spindle:admin"}}]}))
   (write! dir "flows/shop/orders.edn"
@@ -44,7 +45,9 @@
       (jdbc/execute! {:jdbcUrl (str "jdbc:sqlite:" db)} ["insert into lines values (1,'A',2,1.5),(1,'B',1,4.0),(2,'C',3,1.0)"])
       (base-config (io/file dir "config") db)
       (reset! config/state {:snapshot nil :history [] :last-reload nil :pinned false})
-      (binding [*dir* (str (io/file dir "config"))] (t)))))
+      (binding [*dir* (str (io/file dir "config"))
+                spindle.explain/*archive-dir* (str (io/file dir "explain"))]
+        (t)))))
 
 (defn- call [h method uri & [{:keys [key qs]}]]
   (let [r (h {:request-method method :uri uri :query-string qs

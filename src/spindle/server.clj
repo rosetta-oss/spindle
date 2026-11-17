@@ -13,7 +13,8 @@
             [spindle.conn :as conn]
             [spindle.error :as err]
             [spindle.flow :as flow]
-            [spindle.metrics :as metrics])
+            [spindle.metrics :as metrics]
+            [spindle.stepcache :as stepcache])
   (:import [java.time Instant LocalDate LocalDateTime LocalTime OffsetDateTime]
            [java.util UUID]))
 
@@ -92,12 +93,17 @@
   (let [caller (auth/authenticate (:auth snap) req)]
     (when-not caller (err/fail! :unauthenticated "missing or invalid API key"))
     (when-not (auth/allowed? caller (:scopes ep)) (err/fail! :forbidden "missing scope"))
+    (when (and (= :required (:caller ep)) (not (:sub caller)))
+      (err/fail! :unauthenticated "this endpoint needs the end user (X-Spindle-User)"))
     (let [fl (get-in snap [:flows (:flow ep)])
           params (coerce-params (:params-schema fl) (request-params (assoc req :query-params (query-string-params req)) match))
           compute #(flow/execute snap fl params {:caller caller :request-id request-id})
           c (get-in snap [:caches (:id ep)])
           {:keys [value] cache-state :cache} (if c
-                                              (cache/lookup c [(:version fl) params] compute)
+                                              ;; the endpoint cache is per caller whenever any step depends on the caller
+                                              (cache/lookup c [(:version fl) params
+                                                               (when (:caller-dependent? fl) (stepcache/caller-scope caller))]
+                                                            compute)
                                               {:value (compute) :cache :none})]
       (when (= cache-state :stale) (metrics/counter! "spindle_cache_stale_served_total" {:endpoint (:id ep)}))
       {:body {:rows (:rows value)
@@ -114,13 +120,17 @@
     (cond-> {:state (name st)}
       (= st :open) (assoc :half_open_due_after_ms (get-in rt [:guards :breaker-delay-ms])))))
 
-(defn status-body [node-id]
+(defn status-body [node-id admin?]
   (let [snap (config/current)
-        s @config/state]
+        s @config/state
+        lr (:last-reload s)]
     {:node node-id
      :config {:version (:version snap) :loaded_at (:loaded-at snap) :pinned (:pinned s)
-              :last_reload (:last-reload s)
-              :history (mapv :version (:history s))}
+              ;; problem details can name tables and columns: admins only
+              :last_reload (if admin? lr (-> lr (dissoc :problems) (assoc :problem_count (count (:problems lr)))))
+              :history (mapv :version (:history s))
+              :explain (:explain snap)}
+     :step_cache (into {} (map (fn [[[ep st] m]] [(str ep "#" st) m])) (stepcache/stats))
      :endpoints (mapv (fn [ep] {:id (:id ep) :method (name (:method ep)) :path (:path ep)}) (:endpoints snap))
      :connections
      (vec (for [[id rt] (:conns snap)]
@@ -165,7 +175,7 @@
             (json-resp 200 {:status "ready" :config_version (:version snap)})
             (json-resp 503 {:status "not_ready"}))
           (= uri "/metrics") {:status 200 :headers {"Content-Type" "text/plain; version=0.0.4"} :body (metrics/scrape)}
-          (= uri "/status") (json-resp 200 (status-body node-id))
+          (= uri "/status") (json-resp 200 (status-body node-id (admin? snap req)))
 
           (str/starts-with? uri "/admin/")
           (if-not (admin? snap req)
@@ -176,6 +186,9 @@
               (let [v (get (query-string-params req) "to")
                     r (config/rollback! v)] (json-resp (if (:ok r) 200 422) r))
               [:post "/admin/config/unpin"] (do (config/unpin!) (json-resp 200 {:pinned false}))
+              [:post "/admin/cache/evict"]
+              (let [tags (remove str/blank? (str/split (str (get (query-string-params req) "tag")) #","))]
+                (json-resp 200 {:evicted (stepcache/evict-tags! tags)}))
               (json-resp 404 {:error {:code "not_found"}})))
 
           :else

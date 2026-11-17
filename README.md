@@ -1,206 +1,241 @@
 # Spindle
 
-Spindle runs small data flows on request and publishes each flow as an HTTP API.
+Spindle runs small data flows on request and publishes each one as an HTTP API.
 
-- A flow is made of steps. Each step runs **SQL** against a database or calls an **HTTP API**, and the two kinds can be mixed.
-- Later steps take their inputs from earlier results through data paths (`[:order :customerid]`).
-- The results are merged into one output, using declarative rules plus sandboxed SCI expressions.
-- Every connection is protected by a pool, a deadline that really cancels statements, a circuit breaker, a bulkhead and a rate limit.
-- Configuration is hot-reloaded. Nodes are stateless, so you can run as many as you like behind a load balancer.
+- **Steps:** each step runs **SQL** against a database or calls an **HTTP API**, and the two can be mixed.
+- **Data between steps:** a step reads earlier results through data paths (`[:order :customer_id]`).
+- **Conditions:** a step can run only when a condition holds (`:when {:exists [:cust]}`).
+- **Output:** the results are projected and merged into one output.
+- **Protection:** every connection has a pool, a circuit breaker, a bulkhead, a rate limit and a step cache,
+  and every request has a deadline that really cancels statements.
+- **Operations:** the configuration is hot-reloaded. Nodes are stateless, so you can run as many as you like.
 
-Typical callers are semantic or graph layers, for example Semalith with Pathom3, that need
-clean, batchable APIs in front of legacy databases and weak upstream APIs.
+Spindle is built for semantic or graph layers, for example Semalith with Pathom3, that need clean, batchable,
+cacheable APIs in front of legacy databases (Sybase ASE) and heavy upstream APIs.
 
-Licence: **EPL-2.0**. The full design is in [docs/design/0001-spindle-design.md](docs/design/0001-spindle-design.md).
+- Licence: **EPL-2.0**.
+- Design: [docs/design/0001-spindle-design.md](docs/design/0001-spindle-design.md). The section "First release" covers the current scope.
+- Patterns: [docs/guides/cookbook.md](docs/guides/cookbook.md).
 
-## Status
+## Status: first release in progress
 
-**v0.2-dev.** Read-only flows work end to end on PostgreSQL. MySQL and ClickHouse can read, enforce deadlines and cancel statements.
+**Target:** one real Semalith graph fetches through Spindle, with fewer upstream calls, lower p95 latency and fewer ASE lock waits.
 
-| Area | State |
+| First-release item | State |
 |---|---|
-| Single-step and multi-step SQL flows (DAG, parallel per connection, `:or-else`, `:optional`) | ✅ |
-| `:http` steps (data-path query/path/body, list styles, per-key fan-out) | ✅ |
-| Output: `:nest`, `:merge`, `:compute` (SCI sandbox), `:types`, `:select`, `:rename` | ✅ |
-| Deadline → `Statement.cancel` through promesa (verified on PostgreSQL, MySQL, ClickHouse) | ✅ |
-| Per-connection circuit breaker (diehard), bulkhead, rate limit; stale cache on breaker open | ✅ |
-| Caffeine cache: TTL, stale-while-revalidate, single-flight | ✅ |
-| Hot reload (poll, full validation, atomic swap, pool carry-over/retire, rollback + pin) | ✅ |
-| API keys with scopes; `/metrics` (Prometheus), `/health/live`, `/health/ready`, `/status` | ✅ |
-| Dialects: `postgres` (full), `mysql`, `clickhouse` (read, timeout, cancel), `sybase-ase` (written, **not yet verified**: see below) | ⚠️ |
-| Batch route `/api/_batch/…`, keyset paging, OpenAPI, explain endpoint, slow-query log | ⏳ next |
-| JWT, writes (mutation endpoints, transactions, idempotency, audit), `:proc`, authoring MCP, `:search` (Elasticsearch) | ⏳ later |
+| `:sql` steps; `IN` lists expanded and chunked; SQL runs exactly as written | ✅ |
+| `:api` steps (`:http` alias): data-path path/query/body/headers, list styles, per-key fan-out | ✅ |
+| `:when` conditions (`:exists :empty := :all :any :not`), stable `:default` for skipped steps | ✅ |
+| Projection: several endpoints share one heavy upstream call (step cache stores the body; `:rows` applied after) | ✅ |
+| Step cache: TTL per step, single-flight, stale-while-revalidate, stale on failure, `:per :caller`, tags, weight bound | ✅ |
+| Circuit breaker (diehard), bulkhead, rate limit per connection; deadline → `Statement.cancel` | ✅ (PostgreSQL verified) |
+| End-user identity passthrough (`X-Spindle-User`, `X-Spindle-User-Claims`, scope `spindle:delegate`) | ✅ |
+| Publishing checks: timeout and row cap required; explain on reload, archived; broken SQL rejected | ✅ |
+| Hot reload: validate everything, atomic swap, pool carry-over/retire, rollback + pin | ✅ |
+| API keys with scopes; `/metrics`, `/health/live`, `/health/ready`, `/status` (incl. per-step cache hit counts) | ✅ |
+| **Sybase ASE dialect: cancel, timeout, showplan explain** | ⚠️ written; **needs the company ASE**: run `spikes/jconnect-cancel` |
+| Dedicated batch route, keyset paging, OpenAPI, slow-query log | ⏳ next |
 
-A read endpoint already accepts a list key as a comma-separated string (`?order_id=1,2,3`), which is what
-Semalith's api connector sends for batches. The dedicated batch route comes next.
+**Roadmap after the first release**, in order:
+
+1. stored procedures (`:proc`);
+2. Elasticsearch/OpenSearch (`:search`);
+3. SCI expressions (already in the code, but outside the first release's guarantees);
+4. authoring MCP for agents;
+5. writes;
+6. JWT;
+7. DAG parallelism;
+8. MySQL and ClickHouse. The dialects exist and their read, timeout and cancel tests pass, but they are on hold until needed.
 
 ## Requirements
 
 - **JDK 21+** (virtual threads), for example Temurin 21.
 - **Clojure CLI** 1.12+ (`clojure`), for development and tests.
-- **Docker**, for integration tests and container deployment (optional).
+- **Docker** is optional, for the container image.
 
-## Quick start
-
-```sh
-git clone https://github.com/rosetta-oss/spindle.git && cd spindle
-clojure -M:test                         # unit tests + SQLite end-to-end (no services needed)
-SPINDLE_CONFIG_DIR=examples/adventureworks/config bin/spindle     # needs the env vars below
-```
-
-A config directory contains:
-
-```
-connections.edn   ; :sql (JDBC) and :http connections, guards, defaults; secrets as ${ENV} or ${file:/path}
-auth.edn          ; API keys (SHA-256 hashes) and their scopes
-flows/<ns>/<name>.edn  (+ <name>.sql with `-- :name <step-id>` blocks)
-```
-
-A flow (see `examples/adventureworks/config/flows/sales/`):
-
-```clojure
-{:params [:map [:order_id pos-int?]]
- :steps [{:id :order :kind :sql :conn :aw :in {:order_id [:params :order_id]}}
-         {:id :lines :kind :sql :conn :aw :in {:order_id [:order :order_id]}}
-         {:id :stock :kind :http :conn :erp_api :optional true
-          :request {:method :get :path "/inventory" :query {"product_id" [:lines :productid]}} :rows "$[*]"}]
- :output {:from :order :one? true
-          :nest {:lines {:from :lines :on {:order_id :order_id}
-                         :merge {:from :stock :on {:productid :product_id} :select [:on_hand]}
-                         :compute {:line_total (round-half-up (* orderqty unitprice) 2)}}}}
- :cache {:ttl "1m" :stale "5m"}
- :endpoint {:path "/api/sales/orders/{order_id}/with-stock" :scopes #{"sales:read"}}}
-```
-
-Callers send `Authorization: Bearer <key>`. To create a key and its hash for `auth.edn`:
-
-```sh
-KEY=$(openssl rand -hex 24); printf %s "$KEY" | shasum -a 256
-```
-
-## Databases and drivers
-
-| Database | `:dialect` | Driver | Bundled |
-|---|---|---|---|
-| PostgreSQL | `:postgres` | pgjdbc (BSD-2) | yes |
-| ClickHouse | `:clickhouse` | clickhouse-jdbc 0.9 `all` (Apache-2.0) | yes |
-| MySQL / MariaDB | `:mysql` | MariaDB Connector/J (LGPL-2.1) or MySQL Connector/J (GPL-2.0 + FOSS exception) | **no**: put the JAR in `drivers/` |
-| Sybase ASE | `:sybase-ase` | SAP jConnect 16 (proprietary) | **no**: put `jconn4.jar` in `drivers/` |
-
-`bin/spindle` and the container image add `drivers/*.jar` to the classpath. JARs in `drivers/` are git-ignored.
-
-### Notes per database
-
-- **ClickHouse:** Spindle adds `compress=false` to the URL. clickhouse-jdbc 0.9 cannot read compressed responses
-  from ClickHouse 26.x ("Invalid LZ4 magic byte"), and `compress=0` makes 0.9 hang and retry. ClickHouse has no
-  transactions or isolation: a flow that sets `:isolation` on a ClickHouse step is rejected when the config loads.
-- **MySQL 8 (caching_sha2_password) with MariaDB Connector/J:** add `?allowPublicKeyRetrieval=true` to the URL, or use TLS.
-
-### Sybase ASE with jConnect
-
-1. Get jConnect 16 from SAP (it ships with the ASE installer and SDK). Copy `jconn4.jar` into `drivers/`.
-2. Declare the connection in `connections.edn`:
-
-   ```clojure
-   {:legacy {:type :sql
-             :dialect :sybase-ase
-             :driver "com.sybase.jdbc4.jdbc.SybDriver"            ; the default for :sybase-ase
-             :jdbc-url "jdbc:sybase:Tds:${ASE_SERVER}:${ASE_PORT}/${ASE_DB}"
-             :username "${ASE_USER}" :password "${ASE_PASSWORD}"
-             :zone "UTC"                                          ; ASE datetime has no zone
-             :properties {"LANGUAGE" "us_english"}                ; any jConnect property
-             :pool {:max 6}
-             :defaults {:timeout "5s" :isolation :read-uncommitted}  ; only where dirty reads are fine
-             :guard {:concurrency 4 :breaker {:failure-ratio [10 20] :open "30s"}}}}
-   ```
-
-3. Spindle tags its connections with `APPLICATIONNAME=spindle`, so DBAs can see them in `sp_who` and `sysprocesses`.
-
-4. **Before production, run the cancellation test** in [`spikes/jconnect-cancel/`](spikes/jconnect-cancel/README.md).
-   It checks that cancelling a `waitfor delay "00:00:30"` at 5 s really stops the statement on the server, and that the
-   connection is still usable afterwards.
-
-## Tests
+## Run the tests
 
 ```sh
 clojure -M:test
 ```
 
-This runs the unit tests and the SQLite end-to-end tests. The integration tests are skipped unless their environment variables are set:
+This needs no services. It runs:
 
-| Suite | Environment |
+- the unit tests;
+- SQLite end-to-end tests: hot reload, rejection, rollback, caching;
+- the **first-release scenarios** in `test/spindle/scenarios_test.clj`, against an in-process stub API:
+  - projection with one shared upstream call (sequential and concurrent);
+  - a conditional API step;
+  - stale serving when the upstream fails;
+  - per-caller identity and caching;
+  - the publishing checks.
+
+Integration tests run only when their environment variables are set:
+
+| Suite | Environment variables |
 |---|---|
-| PostgreSQL / AdventureWorks (+ PostgREST) | `AW_DB_HOST AW_DB_PORT AW_DB_USER AW_DB_PASSWORD` [`ERP_API_URL ERP_API_TOKEN`] |
-| MySQL | `SPINDLE_IT_MYSQL_URL SPINDLE_IT_MYSQL_USER SPINDLE_IT_MYSQL_PASSWORD` |
-| ClickHouse | `SPINDLE_IT_CH_URL SPINDLE_IT_CH_USER SPINDLE_IT_CH_PASSWORD` |
+| PostgreSQL (AdventureWorks) + its PostgREST API | `AW_DB_HOST AW_DB_PORT AW_DB_USER AW_DB_PASSWORD` and optionally `ERP_API_URL ERP_API_TOKEN` |
+| MySQL (on hold) | `SPINDLE_IT_MYSQL_URL SPINDLE_IT_MYSQL_USER SPINDLE_IT_MYSQL_PASSWORD` (MariaDB driver + MySQL 8: add `?allowPublicKeyRetrieval=true`) |
+| ClickHouse (on hold) | `SPINDLE_IT_CH_URL SPINDLE_IT_CH_USER SPINDLE_IT_CH_PASSWORD` |
 
-Each database suite checks three things:
+AdventureWorks is Microsoft's MIT-licensed sample database (PostgreSQL port: `lorint/AdventureWorks-for-Postgres`).
+The examples in `examples/adventureworks/config/` use it.
 
-- a read works;
-- a statement that runs past the deadline returns `504`;
-- the statement is really gone from the server afterwards (`pg_stat_activity`, `processlist` or `system.processes`).
+## Taking it over in the company environment
 
-AdventureWorks is Microsoft's MIT-licensed sample database. The tests use lorint's PostgreSQL port
-(`lorint/AdventureWorks-for-Postgres`), with PostgREST in front of it for the `:http` step.
+### 1. Sybase ASE driver
 
-## Running
+jConnect is SAP's proprietary JDBC driver. Spindle never bundles it.
+
+1. Copy jConnect 16 (`jconn4.jar`, from the ASE installer or SDK) to `drivers/jconn4.jar`. Files in `drivers/` are git-ignored.
+2. `bin/spindle` and the container image put `drivers/*.jar` on the classpath.
+
+### 2. Verify cancellation on ASE first
+
+Spindle's timeouts depend on this, so run it before anything else:
+
+```sh
+export ASE_URL='jdbc:sybase:Tds:<host>:<port>/<database>'
+export ASE_USER='<login>'
+export ASE_PASSWORD="$(cat /path/to/secret)"
+cd spikes/jconnect-cancel && clojure -M -m jconnect-cancel
+```
+
+The test runs `waitfor delay "00:00:30"` and cancels it after 5 s in four ways. A pass means:
+
+- each test takes about 5 s;
+- the spid is idle afterwards (`AWAITING COMMAND`);
+- the connection is still usable.
+
+See [spikes/jconnect-cancel/README.md](spikes/jconnect-cancel/README.md). Paste the printed results into design doc §6.3.
+
+### 3. Configure a connection
+
+Create `config/connections.edn`. Secrets are always `${ENV}` or `${file:/path}`; literal secrets are rejected.
+
+```clojure
+{:erp {:type :sql
+       :dialect :sybase-ase
+       :jdbc-url "jdbc:sybase:Tds:${ASE_SERVER}:${ASE_PORT}/${ASE_DB}"
+       :username "${ASE_USER}" :password "${ASE_PASSWORD}"
+       :zone "UTC"                                   ; ASE datetime has no zone; set the server's zone
+       :properties {"LANGUAGE" "us_english"}         ; any jConnect property
+       :pool {:max 6}
+       :defaults {:timeout "5s" :max-rows 5000}       ; both are mandatory for every SQL step
+       :guard {:concurrency 4 :queue-wait "500ms" :rate "100/s"
+               :breaker {:failure-ratio [10 20] :open "30s" :half-open-calls 3}}}
+ :orders_api {:type :http
+              :base-url "${ORDERS_API_URL}"
+              :auth {:header "Authorization" :value "Bearer ${ORDERS_API_TOKEN}"}
+              :forward-caller {"X-User-Id" [:caller :sub]}   ; optional: pass the end user upstream
+              :defaults {:timeout "3s"}
+              :guard {:concurrency 8 :breaker {:failure-ratio [5 10] :open "20s"}}}}
+```
+
+**Isolation:** for data where dirty reads are acceptable, add `:isolation :read-uncommitted` to `:defaults` or to a step's
+`:tuning`. You can also write `at isolation read uncommitted` in the SQL. Spindle tags its connections
+`APPLICATIONNAME=spindle`, so DBAs can find them in `sp_who` and `sysprocesses`.
+
+### 4. Keys and identity
+
+`config/auth.edn` stores **hashes** of API keys:
+
+```clojure
+{:api-keys [{:id "semalith" :sha256 "${SEMALITH_KEY_SHA256}" :scopes #{"orders:read" "spindle:delegate"}}
+            {:id "ops" :sha256 "${OPS_KEY_SHA256}" :scopes #{"spindle:admin"}}]}
+```
+
+To create a key and its hash:
+
+```sh
+KEY=$(openssl rand -hex 24); printf %s "$KEY" | shasum -a 256
+```
+
+How a caller identifies itself and its end user:
+
+- **The calling service** sends `Authorization: Bearer <key>`.
+- **The end user**, when the service acts for one, goes in these headers. The key must hold `spindle:delegate`:
+  - `X-Spindle-User: <user id>`
+  - `X-Spindle-User-Claims: <base64url JSON>`, for example `{"territory_id": 4}`.
+- **Inside flows** the user is available as `[:caller :sub]` and `[:caller :claims :territory_id]`. Steps that use it are cached
+  per user automatically.
+
+### 5. Write flows
+
+Write flows under `config/flows/<ns>/<name>.edn`, with SQL in `<name>.sql` blocks (`-- :name <step-id>`).
+Start from the patterns in [docs/guides/cookbook.md](docs/guides/cookbook.md): projection, conditional enrichment,
+batch, archive fallback, per-user data, degrade on failure.
+
+Add `:examples [{:id 12345}]` to a flow so that the mandatory explain binds realistic values.
+Plans are archived under `SPINDLE_EXPLAIN_DIR`.
+
+### 6. Run
+
+```sh
+clojure -T:build uber                                  # → target/spindle.jar
+SPINDLE_CONFIG_DIR=config bin/spindle                   # adds drivers/*.jar
+# or: docker build -t spindle . && docker run -p 8080:8080 \
+#       -v $PWD/config:/opt/spindle/config -v $PWD/drivers:/opt/spindle/drivers \
+#       -v $PWD/explain-archive:/opt/spindle/explain-archive -e SPINDLE_EXPLAIN_DIR=/opt/spindle/explain-archive spindle
+```
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SPINDLE_CONFIG_DIR` | `config` | config directory; polled for changes |
+| `SPINDLE_CONFIG_DIR` | `config` | config directory, polled for changes |
 | `SPINDLE_PORT` | `8080` | HTTP port |
 | `SPINDLE_NODE_ID` | hostname | shown in `/status` |
 | `SPINDLE_POLL_MS` | `5000` | config poll interval |
-
-Build and run:
-
-```sh
-clojure -T:build uber && bin/spindle          # uberjar + drivers/
-docker build -t spindle . && docker run -p 8080:8080 \
-  -v $PWD/config:/opt/spindle/config -v $PWD/drivers:/opt/spindle/drivers spindle
-```
+| `SPINDLE_EXPLAIN_DIR` | `explain-archive` | where plans are archived on publish |
+| `SPINDLE_EXPLAIN` | on | `off` disables the explain check (not recommended) |
+| `SPINDLE_STEP_CACHE_MB` | `256` | step-cache weight bound per node |
 
 **Operations:**
 
-- `GET /status` shows the config version, the last reload result, and every connection's breaker, bulkhead and pool state.
-- `POST /admin/reload`, `POST /admin/config/rollback?to=<version>` and `POST /admin/config/unpin` need a key with the `spindle:admin` scope.
-- **Several nodes:** point every node at the same config source (a git checkout or a shared directory). Each node reports
-  the version it is running, and there is no leader.
+- `GET /status` shows:
+  - the config version, its explain summary and the last reload result (details for admin keys only);
+  - for every connection, the breaker, bulkhead, pool and last error;
+  - hit, miss and stale counts per step.
+- Admin endpoints (`spindle:admin` scope):
+  - `POST /admin/reload`
+  - `POST /admin/config/rollback?to=<version>` (pins the node)
+  - `POST /admin/config/unpin`
+  - `POST /admin/cache/evict?tag=<tag>`
+- **Several nodes:** point every node at the same config source (a git checkout or a shared directory). Each node
+  reports the version it is running. Each node has its own cache, so nodes can differ for at most the TTL.
 
-## Development
+## Databases and drivers
 
-The code is in `src/spindle/`:
+| Database | `:dialect` | Driver | Bundled |
+|---|---|---|---|
+| Sybase ASE | `:sybase-ase` | SAP jConnect 16 (proprietary) | **no**: `drivers/jconn4.jar` |
+| PostgreSQL | `:postgres` | pgjdbc (BSD-2) | yes |
+| MySQL / MariaDB (on hold) | `:mysql` | MariaDB Connector/J (LGPL-2.1) or MySQL Connector/J (GPL-2.0 + FOSS exception) | **no**: `drivers/` |
+| ClickHouse (on hold) | `:clickhouse` | clickhouse-jdbc 0.9 `all` (Apache-2.0) | yes. Spindle adds `compress=false`: 0.9 cannot read ClickHouse 26's compressed responses, and `compress=0` hangs |
 
-| File | Purpose |
+## Development notes
+
+Source files in `src/spindle/`:
+
+| Area | Files |
 |---|---|
-| `config.clj` | loading, validation, snapshots, hot reload |
-| `flow.clj` | compiling and running flows |
-| `executor.clj` | the DAG scheduler: promesa futures on virtual threads |
-| `sql.clj` | SQL steps: binding, `IN` chunking, cancel, tuning |
-| `httpstep.clj` | HTTP steps |
-| `output.clj` | output shaping |
-| `expr.clj` | SCI sandbox |
-| `conn.clj` | pools and guards |
-| `dialect.clj` | per-database differences |
-| `cache.clj` | Caffeine cache |
-| `auth.clj` | API keys |
-| `server.clj` | HTTP handler |
-| `metrics.clj` | metrics |
+| Configuration | `config.clj` (load, validate, snapshot, reload), `explain.clj` (mandatory explain archive) |
+| Flows | `flow.clj` (compile and run, `:when`, step cache use), `executor.clj` (DAG scheduler: promesa + virtual threads) |
+| Steps | `sql.clj`, `httpstep.clj`, `stepcache.clj` |
+| Output | `output.clj` (projection and merge), `expr.clj` (SCI, roadmap) |
+| Infrastructure | `conn.clj` (pools and guards), `dialect.clj`, `auth.clj` (keys and identity), `server.clj`, `metrics.clj` |
 
 **Rules:**
 
-- SQL is executed **as written**. Spindle only binds parameters and expands `IN` lists.
+- SQL runs exactly as written.
 - Driver and upstream messages never reach callers.
-- No secrets in config files: write `${ENV}` or `${file:/path}`.
+- No secrets in config files.
 
-### Next steps
+**Next steps:**
 
-1. **Batch route** `POST /api/_batch/<endpoint>` with a per-key cache, plus keyset paging.
-2. **API description and tuning:** OpenAPI 3.1 generated from the malli schemas, `POST /admin/explain/<endpoint>`, and the slow-query log.
-3. **Sybase ASE:** run `spikes/jconnect-cancel` on a real ASE, then finish the `:sybase-ase` dialect (showplan explain, session reset) and record the results in the design doc.
-4. **More callers and step types:** JWT issuers, then writes (mutation endpoints, one transaction per connection, idempotency keys, audit) and `:proc` steps.
-5. **Authoring MCP:** for agents writing flows, on mcp-shuttle (`list_connections`, `describe_table`, `validate_flow`, `test_run`, `explain`, `publish`).
-6. **Search step:** `:search` for Elasticsearch/OpenSearch (Query DSL as EDN, ES|QL, search_after + PIT).
+1. Run `spikes/jconnect-cancel` on the company ASE. Fix the `:sybase-ase` dialect if needed, and record the results in design §6.3.
+2. Write the first real flows for the target Semalith graph. Measure upstream calls, p95 latency and ASE lock waits before and after.
+3. Add the batch route `POST /api/_batch/<endpoint>` with a per-key cache, keyset paging, OpenAPI 3.1 and the slow-query log.
+4. Add `:proc` steps for ASE stored procedures: several result sets, OUT parameters, return status.
 
 ## Licence
 

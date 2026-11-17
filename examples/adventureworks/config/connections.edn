@@ -6,7 +6,7 @@
            :password "${AW_DB_PASSWORD}"
            :zone "UTC"
            :pool {:max 6 :min-idle 1}
-           :defaults {:timeout "3s" :isolation :read-committed :fetch-size 500}
+           :defaults {:timeout "3s" :max-rows 5000 :isolation :read-committed :fetch-size 500}
            :guard {:concurrency 4 :queue-wait "500ms" :rate "200/s"
                    :breaker {:failure-ratio [10 20] :open "30s" :half-open-calls 3}}}
  :erp_api {:type :http

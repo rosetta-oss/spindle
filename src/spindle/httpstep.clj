@@ -64,7 +64,14 @@
               (.timeout (Duration/ofMillis timeout-ms))
               (.header "Accept" "application/json")
               (.header "User-Agent" "spindle"))]
-    (doseq [[k v] (merge (:headers cfg) headers)] (.header b (name k) (str v)))
+    ;; static connection headers, step headers (literal or data path), and the
+    ;; connection's :forward-caller headers ({header path}, e.g. {"X-User-Id" [:caller :sub]})
+    (doseq [[k v] (merge (:headers cfg) headers (:forward-caller cfg))
+            :let [v (if (vector? v)
+                      (let [r (paths/resolve-path v env)] (if (sequential? r) (str/join "," r) r))
+                      v)]
+            :when (some? v)]
+      (.header b (name k) (str v)))
     (when-let [{:keys [header value]} (:auth cfg)] (.header b header value))
     (case (or method :get)
       :get (.GET b)
@@ -89,8 +96,8 @@
             status (.statusCode resp)]
         (cond
           (<= 200 status 299)
-          (json-rows (json/read-value (.body resp) mapper) (:rows step))
-          (and (= 404 status) (:empty-on-404 step)) []
+          (let [b (.body resp)] (if (str/blank? b) nil (json/read-value b mapper)))
+          (and (= 404 status) (:empty-on-404 step)) nil
           :else (err/fail! (classify-status status) (str "upstream status " status)
                            {:step (:id step) :conn (:id rt) :status status})))
       (catch CancellationException _ (err/fail! :timeout "request cancelled" {:step (:id step)}))
@@ -101,13 +108,19 @@
                      "upstream call failed" {:step (:id step) :conn (:id rt)} c)))
       (finally (sql/deregister-cancel! cancels k)))))
 
-(defn run-step!
+(defn fetch!
+  "Call the upstream; → vector of parsed response bodies (one per call; fan-out
+   makes several). Bodies, not rows, are what the step cache stores, so several
+   steps/endpoints projecting different parts of one response share one call."
   [rt step env ctx]
   (if-let [fan-path (:fan-out step)]
-    ;; one call per value (bounded by the connection's bulkhead), in order
     (let [vs (paths/as-list (paths/resolve-path fan-path env))]
-      (->> vs
-           (mapv (fn [v] (conn/guarded rt #(call-once! rt step (assoc env :fan v) ctx))))
-           (apply concat)
-           vec))
-    (conn/guarded rt #(call-once! rt step env ctx))))
+      (mapv (fn [v] (conn/guarded rt #(call-once! rt step (assoc env :fan v) ctx))) vs))
+    [(conn/guarded rt #(call-once! rt step env ctx))]))
+
+(defn extract
+  "Apply the step's :rows JSON path to each body and concatenate."
+  [step bodies]
+  (vec (mapcat #(if (nil? %) [] (json-rows % (:rows step))) bodies)))
+
+(defn run-step! [rt step env ctx] (extract step (fetch! rt step env ctx)))

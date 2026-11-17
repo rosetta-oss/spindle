@@ -25,6 +25,7 @@
             [spindle.cache :as cache]
             [spindle.conn :as conn]
             [spindle.env :as env]
+            [spindle.explain :as explain]
             [spindle.flow :as flow]
             [spindle.metrics :as metrics]
             [spindle.sqlfile :as sqlfile])
@@ -78,6 +79,7 @@
            [:headers {:optional true} [:map-of [:or keyword? string?] string?]]
            [:auth {:optional true} [:map [:header string?] [:value string?]]]
            [:list-style {:optional true} [:enum :csv :repeat :postgrest-in]]
+           [:forward-caller {:optional true} [:map-of string? [:vector {:min 2} keyword?]]]
            [:pool {:optional true} [:map [:connection-timeout {:optional true} [:or string? int?]]]]
            [:defaults {:optional true} [:map [:timeout {:optional true} [:or string? int?]]]]
            [:guard {:optional true} Guard]]]])
@@ -93,7 +95,7 @@
    [:steps {:optional true}
     [:vector [:map
               [:id keyword?]
-              [:kind [:enum :sql :http]]
+              [:kind [:enum :sql :api :http]]
               [:conn keyword?]
               [:in {:optional true} [:map-of keyword? Path]]
               [:sql {:optional true} string?]
@@ -101,6 +103,13 @@
               [:rows {:optional true} string?]
               [:fan-out {:optional true} Path]
               [:or-else {:optional true} keyword?]
+              [:when {:optional true} map?]
+              [:default {:optional true} any?]
+              [:cache {:optional true} [:map [:ttl [:or string? int?]]
+                                        [:stale {:optional true} [:or string? int?]]
+                                        [:stale-if-error {:optional true} [:or string? int?]]
+                                        [:per {:optional true} [:enum :caller]]
+                                        [:tags {:optional true} [:vector [:or keyword? string?]]]]]
               [:optional {:optional true} boolean?]
               [:skip-when-empty {:optional true} boolean?]
               [:empty-on-404 {:optional true} boolean?]
@@ -111,11 +120,13 @@
    [:cache {:optional true} map?]
    [:limits {:optional true} [:map [:timeout {:optional true} [:or string? int?]]
                               [:max-rows {:optional true} pos-int?]]]
+   [:examples {:optional true} [:vector map?]]
    [:endpoint {:optional true}
     [:map
      [:path string?]
      [:method {:optional true} [:enum :get :post]]
      [:scopes {:optional true} [:set string?]]
+     [:caller {:optional true} [:enum :required :optional]]
      [:batch {:optional true} [:map [:key keyword?]]]]]])
 
 ;; ---------------------------------------------------------------------------
@@ -133,6 +144,9 @@
     (->> (file-seq root)
          (filter #(.isFile ^File %))
          (filter #(re-find #"\.(edn|sql)$" (.getName ^File %)))
+         ;; hidden files (editor swap files, macOS ._ AppleDouble files) are not config
+         (remove #(some (fn [^java.nio.file.Path p] (.startsWith (str p) "."))
+                        (iterator-seq (.iterator (.relativize base (.toPath ^File %))))))
          (map (fn [^File f] [(str (.relativize base (.toPath f))) (slurp f)]))
          (into (sorted-map)))))
 
@@ -202,9 +216,18 @@
                                   :when s]
                               (let [old (get-in prev [:caches id])]
                                 [id (if (and old (= s (:settings old))) old (cache/make id s metrics/registry))])))
+            ;; mandatory explain (archived); SQL errors reject the whole reload
+            ex (explain/explain-all! flows rts)
+            _ (when (seq (:problems ex))
+                (let [prev-live (set (mapcat (juxt :ds :client) (vals prev-conns)))]
+                  (doseq [rt (vals rts) :when (not (prev-live (or (:ds rt) (:client rt))))]
+                    (conn/close! rt))))
             router (r/router (mapv (fn [{:keys [path] :as ep}] [path {:name (keyword (:id ep)) ::endpoint ep}]) endpoints)
                              {:conflicts nil})]
+        (if (seq (:problems ex))
+          {:problems (:problems ex)}
         {:snapshot {:version (tree-version tree)
+                    :explain (dissoc ex :problems)
                     :loaded-at (str (Instant/now))
                     :tree tree
                     :conns rts
@@ -213,7 +236,7 @@
                     :router router
                     :caches caches
                     :auth (auth/compile-auth auth-raw)
-                    :inflight (AtomicLong. 0)}}))))
+                    :inflight (AtomicLong. 0)}})))))
 
 ;; ---------------------------------------------------------------------------
 ;; the live state

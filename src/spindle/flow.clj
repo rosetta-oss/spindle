@@ -4,8 +4,11 @@
    A flow is an instruction set — data interpreted by the engine. Compilation
    checks everything that can be checked without running: placeholders have
    bindings, paths point at existing steps, the step graph has no cycles, the
-   dialect supports what the step asks for, writes are refused (v0.1/v0.2 are
-   read-only; mutation endpoints arrive later), and expressions parse."
+   dialect supports what the step asks for, writes are refused (the first
+   version is read-only), expressions parse, and — mandatory before publishing —
+   every SQL step has a timeout and a row cap.
+
+   Step kinds: :sql, :api (alias :http). Conditions: :when (declarative)."
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [malli.core :as m]
@@ -18,7 +21,8 @@
             [spindle.output :as output]
             [spindle.paths :as paths]
             [spindle.sql :as sql]
-            [spindle.sqlfile :as sqlfile])
+            [spindle.sqlfile :as sqlfile]
+            [spindle.stepcache :as stepcache])
   (:import [java.util.concurrent TimeUnit TimeoutException ExecutionException]))
 
 (def max-steps 16)
@@ -28,12 +32,57 @@
 
 (defn- path-steps [p] (when-let [s (paths/step-ref p)] #{s}))
 
-(defn- step-deps [{:keys [in request or-else fan-out]}]
+(defn- request-paths [request]
+  (concat (vals (:query request)) (vals (:path-params request)) (vals (:body request))
+          (filter vector? (vals (:headers request)))))
+
+;; ---------------------------------------------------------------------------
+;; :when — declarative conditions over earlier results
+;;   {:exists path}  {:empty path}  {:= [path value]}
+;;   {:all [c ...]}  {:any [c ...]}  {:not c}
+;; ---------------------------------------------------------------------------
+
+(defn- cond-paths [c]
+  (cond
+    (:exists c) [(:exists c)]
+    (:empty c) [(:empty c)]
+    (:= c) [(first (:= c))]
+    (:all c) (mapcat cond-paths (:all c))
+    (:any c) (mapcat cond-paths (:any c))
+    (:not c) (cond-paths (:not c))
+    :else nil))
+
+(defn- valid-cond? [c]
+  (and (map? c) (= 1 (count c))
+       (case (key (first c))
+         (:exists :empty) (vector? (val (first c)))
+         := (and (vector? (val (first c))) (= 2 (count (val (first c)))))
+         (:all :any) (and (sequential? (val (first c))) (every? valid-cond? (val (first c))))
+         :not (valid-cond? (val (first c)))
+         false)))
+
+(defn- present? [v] (if (sequential? v) (boolean (seq v)) (some? v)))
+
+(defn eval-cond [c env]
+  (cond
+    (:exists c) (present? (paths/resolve-path (:exists c) env))
+    (:empty c) (not (present? (paths/resolve-path (:empty c) env)))
+    (:= c) (let [[p v] (:= c) x (paths/resolve-path p env)]
+             (if (sequential? x) (= [v] (vec x)) (= v x)))
+    (:all c) (every? #(eval-cond % env) (:all c))
+    (:any c) (boolean (some #(eval-cond % env) (:any c)))
+    (:not c) (not (eval-cond (:not c) env))
+    :else false))
+
+(defn- step-deps [{:keys [in request or-else fan-out when]}]
   (set (concat (mapcat path-steps (vals in))
-               (mapcat path-steps (vals (:query request)))
-               (mapcat path-steps (vals (:path-params request)))
-               (mapcat path-steps (vals (:body request)))
-               (path-steps fan-out))))
+               (mapcat path-steps (request-paths request))
+               (path-steps fan-out)
+               (mapcat path-steps (cond-paths when)))))
+
+(defn- uses-caller? [{:keys [in request when]} conn-cfg]
+  (boolean (or (some #(= :caller (first %)) (concat (vals in) (request-paths request) (cond-paths when)))
+               (seq (:forward-caller conn-cfg)))))
 
 (defn- cycle? [deps]
   ;; deps: {id #{ids}}; Kahn's algorithm
@@ -59,12 +108,21 @@
         ids (set (map :id steps-raw))
         compiled
         (into {}
-              (for [{:keys [id kind conn in] :as s} steps-raw]
+              (for [{:keys [id conn in] :as s} steps-raw
+                    :let [kind (if (= :api (:kind s)) :http (:kind s))
+                          s (assoc s :kind kind)]]
                 (let [ccfg (get conns conn)
                       d (spindle.dialect/get-dialect (:dialect ccfg))
-                      base (merge {:skip-when-empty true} s
+                      caller? (uses-caller? s ccfg)
+                      cache-s (stepcache/settings (:cache s))
+                      base (merge {:skip-when-empty true :default []} s
                                   {:deps (step-deps s)
-                                   :tuning (merge (:defaults ccfg) (:tuning s))})]
+                                   :tuning (merge (:defaults ccfg) (:tuning s))
+                                   :caller-dependent? caller?
+                                   ;; a caller-dependent step is always cached per caller
+                                   :step-cache (when cache-s (cond-> cache-s caller? (assoc :per :caller)))})]
+                  (when (and (:when s) (not (valid-cond? (:when s))))
+                    (add! [:steps id :when] "invalid condition; use {:exists path} {:empty path} {:= [path v]} {:all [..]} {:any [..]} {:not c}"))
                   (when-not (keyword? id) (add! [:steps] "every step needs a keyword :id"))
                   (when-not ccfg (add! [:steps id :conn] (str "unknown connection " conn)))
                   (doseq [dep (:deps base) :when (not (ids dep))]
@@ -91,15 +149,22 @@
                            (when (and (get-in base [:tuning :isolation]) (not (:isolation? d)))
                              (add! [:steps id :tuning :isolation]
                                    (str "dialect " (name (or (:dialect ccfg) :generic)) " has no transaction isolation")))
-                           (assoc base :scanned scanned :sql-text text
-                                  :max-rows (or (:max-rows s) (get-in base [:tuning :max-rows]) (:max-rows raw) 10000)))))
+                           ;; mandatory before publishing: every SQL step has a timeout and a row cap
+                           (when-not (get-in base [:tuning :timeout])
+                             (add! [:steps id :tuning :timeout]
+                                   "every SQL step needs a timeout (step :tuning :timeout or the connection's :defaults :timeout)"))
+                           (let [mr (or (:max-rows s) (get-in base [:tuning :max-rows]) (get-in raw [:limits :max-rows]))]
+                             (when-not mr
+                               (add! [:steps id :max-rows]
+                                     "every SQL step needs a row cap (:max-rows on the step, the flow's :limits, or the connection's :defaults)"))
+                             (assoc base :scanned scanned :sql-text text :max-rows mr)))))
                      :http
                      (do (when (and ccfg (not= :http (:type ccfg)))
                            (add! [:steps id :conn] "an :http step needs an :http connection"))
                          (when (not (#{:get :post nil} (get-in s [:request :method])))
                            (add! [:steps id :request :method] "only GET/POST reads are allowed for now"))
                          base)
-                     (do (add! [:steps id :kind] (str "unknown step kind " kind)) base))])))
+                     (do (add! [:steps id :kind] (str "unknown step kind " kind " (use :sql or :api)")) base))])))
         deps (into {} (map (fn [[id s]] [id (set/intersection (:deps s) ids)])) compiled)
         deadline-ms (conn/parse-duration-ms (get-in raw [:limits :timeout]) 5000)
         out-spec (try (output/compile-spec (merge {:from (first (map :id steps-raw))} (:output raw)))
@@ -117,6 +182,8 @@
               :deadline-ms deadline-ms
               :parallel (:parallel raw)
               :cache (:cache raw)
+              :caller-dependent? (boolean (some :caller-dependent? (vals compiled)))
+              :examples (:examples raw)
               :endpoint (:endpoint raw)
               :doc (:doc raw)}})))
 
@@ -136,17 +203,39 @@
           {:values {}}
           (distinct (filter map? scanned))))
 
+(defn- resolve-request [request env]
+  (let [rv (fn [m] (into (sorted-map) (map (fn [[k p]] [k (if (vector? p) (paths/resolve-path p env) p)])) m))]
+    (-> request
+        (update :query rv) (update :path-params rv) (update :body #(when % (rv %))) (update :headers rv))))
+
+(defn- cached
+  "Run `compute` through the step cache when the step has :cache settings."
+  [step flow-id env cache-payload compute]
+  (if-let [s (:step-cache step)]
+    (let [k [(:conn step) (:kind step) cache-payload
+             (when (= :caller (:per s)) (stepcache/caller-scope (:caller env)))]]
+      (:rows (stepcache/lookup k s [flow-id (name (:id step))] compute)))
+    (compute)))
+
 (defn- run-step [snapshot flow-id tag-id {:keys [deadline-ns]} step env cancels]
   (let [rt (get-in snapshot [:conns (:conn step)])
         ctx {:deadline-ns deadline-ns :cancels cancels :tag (str flow-id "#" (name (:id step)) " " tag-id)}
         t0 (System/nanoTime)]
     (try
-      (case (:kind step)
-        :sql (let [{:keys [values empty]} (sql-values step env)]
-               (if (and empty (:skip-when-empty step))
-                 []
-                 (sql/run-step! rt step values ctx)))
-        :http (httpstep/run-step! rt step env ctx))
+      (if (and (:when step) (not (eval-cond (:when step) env)))
+        (:default step)                       ; skipped: a stable, declared value
+        (case (:kind step)
+          :sql (let [{:keys [values empty]} (sql-values step env)]
+                 (if (and empty (:skip-when-empty step))
+                   []
+                   (cached step flow-id env [(:sql-text step) (into (sorted-map) values)]
+                           #(sql/run-step! rt step values ctx))))
+          :http (let [env (cond-> env (seq (get-in rt [:cfg :forward-caller])) (assoc :forward-caller (get-in rt [:cfg :forward-caller])))]
+                  (httpstep/extract
+                   step
+                   (cached step flow-id env [(resolve-request (:request step) env)
+                                             (when-let [f (:fan-out step)] (paths/resolve-path f env))]
+                           #(httpstep/fetch! rt step env ctx))))))
       (finally
         (spindle.metrics/timer! "spindle_step_seconds" {:endpoint flow-id :step (name (:id step)) :kind (name (:kind step))}
                                 (- (System/nanoTime) t0))))))

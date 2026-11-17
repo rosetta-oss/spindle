@@ -16,15 +16,17 @@
             [next.jdbc :as jdbc]
             [spindle.auth :as auth]
             [spindle.config :as config]
+            [spindle.explain]
             [spindle.server :as server]))
 
 (defn- env [k] (System/getenv k))
 (def api-key "it-key")
 (def mapper (json/object-mapper {:decode-key-fn true}))
-
-(use-fixtures :each (fn [t] (reset! config/state {:snapshot nil :history [] :last-reload nil :pinned false}) (t)))
-
 (defn- tmpdir [] (doto (io/file (System/getProperty "java.io.tmpdir") (str "spindle-it-" (System/nanoTime))) (.mkdirs)))
+
+(use-fixtures :each (fn [t] (reset! config/state {:snapshot nil :history [] :last-reload nil :pinned false})
+                       (binding [spindle.explain/*archive-dir* (str (tmpdir))] (t))))
+
 
 (defn- write! [dir rel text] (let [f (io/file dir rel)] (io/make-parents f) (spit f text)))
 
@@ -97,7 +99,7 @@
       (write! dir "connections.edn"
               (pr-str {:my {:type :sql :dialect :mysql :jdbc-url (env "SPINDLE_IT_MYSQL_URL")
                             :username "${SPINDLE_IT_MYSQL_USER}" :password "${SPINDLE_IT_MYSQL_PASSWORD}"
-                            :defaults {:timeout "3s"}}}))
+                            :defaults {:timeout "3s" :max-rows 1000}}}))
       (write! dir "auth.edn" (auth-edn))
       (write! dir "flows/it/read.edn" (pr-str {:steps [{:id :r :kind :sql :conn :my :sql "select 1 as one, 'x' as s"}]
                                                 :endpoint {:path "/it/read" :scopes #{"it"}}}))
@@ -124,7 +126,7 @@
       (write! dir "connections.edn"
               (pr-str {:ch {:type :sql :dialect :clickhouse :jdbc-url (env "SPINDLE_IT_CH_URL")
                             :username "${SPINDLE_IT_CH_USER}" :password "${SPINDLE_IT_CH_PASSWORD}"
-                            :defaults {:timeout "3s"}}}))
+                            :defaults {:timeout "3s" :max-rows 1000}}}))
       (write! dir "auth.edn" (auth-edn))
       (write! dir "flows/it/read.edn" (pr-str {:params '[:map [:n pos-int?]]
                                                 :steps [{:id :r :kind :sql :conn :ch :sql "select number as n from numbers(10) where number < :n order by n"

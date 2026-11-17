@@ -136,15 +136,40 @@
           (recur (rest rs) (into acc rows)))
         acc))))
 
+(defn- warnings-text [^java.sql.SQLWarning w]
+  (loop [w w acc []]
+    (if w (recur (.getNextWarning w) (conj acc (.getMessage w))) (str/join "\n" acc))))
+
 (defn explain!
-  "Plan for one rendered statement via the dialect, on a fresh (non-pooled) connection."
+  "Plan for one rendered statement via the dialect. Runs on a connection that
+   is evicted afterwards, so no session setting leaks into the pool.
+   → vector of plan rows, or [{:plan text}] for showplan dialects."
   [rt sql-text args]
   (let [d (:dialect rt)
-        ex (:explain d)]
-    (cond
-      (fn? ex)
-      (with-open [^Connection con (.getConnection ^javax.sql.DataSource (:ds rt))
-                  ^PreparedStatement ps (.prepareStatement con (ex sql-text))]
-        (doseq [[i v] (map-indexed vector args)] (.setObject ps (int (inc i)) v))
-        (with-open [rs (.executeQuery ps)] (read-rows rs 10000)))
-      :else [{:plan "explain not supported for this dialect yet"}])))
+        ex (:explain d)
+        ^javax.sql.DataSource ds (:ds rt)
+        ^Connection con (.getConnection ds)]
+    (try
+      (cond
+        (fn? ex)
+        (with-open [^PreparedStatement ps (.prepareStatement con (ex sql-text))]
+          (.setQueryTimeout ps 10)
+          (doseq [[i v] (map-indexed vector args)] (.setObject ps (int (inc i)) v))
+          (with-open [rs (.executeQuery ps)] (read-rows rs 10000)))
+
+        (= :showplan ex)
+        ;; Sybase ASE: showplan text arrives as warnings; noexec compiles without running
+        (with-open [st (.createStatement con)]
+          (.execute st "set showplan on")
+          (.execute st "set noexec on")
+          (let [text (with-open [^PreparedStatement ps (.prepareStatement con sql-text)]
+                       (.setQueryTimeout ps 10)
+                       (doseq [[i v] (map-indexed vector args)] (.setObject ps (int (inc i)) v))
+                       (try (.execute ps) (catch SQLException _ nil))
+                       (str (warnings-text (.getWarnings ps)) "\n" (warnings-text (.getWarnings con))))]
+            [{:plan (str/trim text)}]))
+
+        :else [{:plan "explain not supported for this dialect"}])
+      (finally
+        (conn/evict! rt con)
+        (try (.close con) (catch Throwable _ nil))))))

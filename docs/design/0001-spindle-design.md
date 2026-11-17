@@ -14,7 +14,7 @@ Licence: **EPL-2.0**. Open source.
 | D4 | Engine: Spindle's own scheduler + promesa + virtual threads. A cancelled promise triggers `Statement.cancel`, verified on PostgreSQL, MySQL and ClickHouse. jConnect is still to be verified on a company ASE (`spikes/jconnect-cancel`). |
 | D5 | Every connection has a diehard circuit breaker, a bulkhead and a rate limiter. When the breaker is open, Spindle fails fast or serves stale cached data, marked as stale. |
 | D6 | Monitoring (`/metrics`, `/health/*`, `/status`), multiple nodes (stateless, no leader, local cache) and hot reload (validate, then swap atomically; the old version finishes in-flight requests) are required. |
-| D7 | Dialects in the first batch: `postgres` (complete), `mysql`, `clickhouse`, `sybase-ase`. A dialect only covers what Spindle adds around the author's SQL (§10.1). |
+| D7 | Dialects: first release `sybase-ase` + `postgres` (+ HTTP APIs). `mysql` and `clickhouse` are already written and tested (read, timeout, cancel) but are not developed further until Semalith meets a source it cannot read itself. A dialect only covers what Spindle adds around the author's SQL (§10.1). |
 | D8 | Bundled drivers: PostgreSQL (BSD-2) and clickhouse-jdbc (Apache-2.0). Users supply MySQL drivers (GPL+FOSS exception or LGPL) and jConnect (proprietary) through `drivers/`. |
 | D9 | Writes are supported: declared mutation endpoints, one transaction per connection, no two-phase commit, idempotency keys and an audit record (planned). |
 | D10 | SCI expressions are allowed, with an allowlist, no I/O, no loops, and a deadline. |
@@ -23,6 +23,130 @@ Licence: **EPL-2.0**. Open source.
 | D13 | Callers authenticate with API keys (done) and JWT (planned), with scopes per endpoint. |
 | D14 | Elasticsearch/OpenSearch is supported through a `:search` step over HTTP, not JDBC (§5.6, planned after the PostgreSQL main line). |
 | D15 | Development and integration tests run on PostgreSQL AdventureWorks, MySQL 8.4 and ClickHouse 26 containers. ASE is tested only on the company test server. |
+
+## First release (scope agreed 2026-11-17)
+
+**Goal.** One real Semalith graph in the company fetches its data through Spindle instead of the
+current upstream APIs and direct reads. It succeeds when three things are better than today:
+
+- the number of upstream calls;
+- p95 latency;
+- lock waits on ASE.
+
+**In scope:**
+
+| Area | Contents |
+|---|---|
+| Sources | Sybase ASE (jConnect, supplied by the user), PostgreSQL (tests and demo), HTTP APIs |
+| Steps | `:sql`, `:api` (`:http` is an alias), `:when` conditions, projection output (split one heavy API into header and detail endpoints) |
+| Stability | step cache (TTL per step, single-flight, stale-while-revalidate, `:per :caller`), circuit breaker, bulkhead, timeout, cancellation |
+| Operations | metrics, `/health/*`, `/status`, file hot reload (validate, then swap atomically), API keys |
+| Identity | **end-user identity passthrough (required)**, see §F1 |
+| Publishing | **mandatory checks**: every SQL step has a timeout and a row cap; explain runs on reload and is archived. There is no approval step. See §F3 |
+
+**Boundary rule.** A flow fetches **one business object, close to its source**: one order, a customer's credit, an
+invoice and its lines. Composition across objects (customer → orders → shipments) belongs to the caller's
+graph (Semalith/Pathom). Every hop is its own flow. Test: *would a caller ever want step 1's result on
+its own, as a separate object?* If yes, step 1 belongs in its own flow.
+
+**Roadmap after the first release, in order:**
+
+1. stored procedures (`:proc`), probably needed for ASE;
+2. Elasticsearch / OpenSearch (`:search`, §5.6);
+3. SCI expressions (already implemented, but not part of the first release's guarantees);
+4. authoring MCP (agents write flows);
+5. writes (mutation endpoints);
+6. JWT;
+7. better parallelism in multi-step DAGs;
+8. MySQL and ClickHouse (only once Semalith needs them).
+
+### F1. End-user identity passthrough
+
+A semantic layer serves people. When it calls Spindle on behalf of a person, three things must follow that person:
+
+- the SQL parameters (row-level filters);
+- the upstream API calls (so upstream permissions apply);
+- the cache key, so that **A's rows are never served to B**.
+
+**Wire format.** The caller authenticates as a service with its API key, and adds:
+
+```
+Authorization: Bearer <service key>           ; key must hold scope "spindle:delegate" to send the next two
+X-Spindle-User: <subject>                     ; opaque, stable user id, ≤ 256 chars
+X-Spindle-User-Claims: <base64url(JSON)>      ; optional object, ≤ 4 KB, e.g. {"territory_id":4,"roles":["sales"]}
+```
+
+**Rules:**
+
+- A key without `spindle:delegate` that sends these headers gets `403`. The headers are never silently ignored.
+- An endpoint can declare `:caller :required`. A call without `X-Spindle-User` then gets `401`.
+- In flows the caller is the data-path root `:caller`:
+  - `[:caller :client]` is the service key id;
+  - `[:caller :sub]` is the end user;
+  - `[:caller :claims :territory_id]` is a claim.
+- An `:http` connection can forward the caller with `:forward-caller {"X-User-Id" [:caller :sub]}`.
+- **Automatic per-caller caching.** A step that uses `[:caller …]` (in `:in`, `:request` or `:when`), or that runs on a
+  connection with `:forward-caller`, is cached **per caller**, whatever its `:cache` says.
+  The endpoint-level cache of a flow that contains such a step is per caller as well.
+  The cache key holds a hash of (client, subject, claims), never the raw values.
+- **Trust.** Spindle trusts the delegating service to tell the truth about the user, the same way a database trusts
+  an application login. Signed identity (JWT from the identity provider) is on the roadmap. It replaces the claims
+  header without changing how flows refer to `:caller`.
+
+### F2. Step-level cache
+
+The cache sits on the step (one upstream call), not only on the endpoint, so several endpoints that project
+the same heavy call share it. This is the projection scenario: `/orders/{id}/header` and
+`/orders/{id}/lines` both come from one upstream `GET /orders/{id}`.
+
+```clojure
+{:id :order :kind :api :conn :orders_api
+ :request {:method :get :path "/orders/{id}" :path-params {:id [:params :id]}}
+ :rows "$.header"                                  ; projection is applied after the cache
+ :cache {:ttl "30s" :stale "2m" :stale-if-error "10m" :per :caller :tags [:orders]}}
+```
+
+**Key:** connection + step kind + normalised request + caller scope.
+
+- For SQL, the normalised request is the statement text plus the bound values.
+- For HTTP, it is the method, path, query, body and forwarded headers after data paths are resolved, plus the fan-out values.
+
+**What is stored:** the raw response body (HTTP) or rows (SQL). JSON-path projection happens after the cache,
+which is what lets different projections share one entry.
+
+**Defaults:** SQL steps are not cached unless they say so. API steps are cached only when they say so.
+
+**Behaviour:**
+
+| Feature | What happens |
+|---|---|
+| Single-flight | concurrent identical misses make one upstream call; the others wait for it |
+| Stale-while-revalidate | after `:ttl`, an entry is served for up to `:stale` while one background refresh runs |
+| Stale on failure | when the source fails (breaker open, timeout, 5xx), an entry still within `:stale-if-error` is served |
+| Bound | total weight in approximate bytes (`SPINDLE_STEP_CACHE_MB`, default 256) |
+| Tags | entries keep their `:tags`; `POST /admin/cache/evict?tag=orders` drops them on that node. Mutation endpoints will declare `:invalidates [tags]` when writes arrive |
+| Observability | `/status` → `step_cache` gives hit/miss/stale counts per `endpoint#step`; metric `spindle_step_cache_total{endpoint,step,result}`; Caffeine metrics under `cache="steps"` |
+
+**Several nodes:** each node has its own cache. Two nodes can return different data for the same key
+for **at most the TTL**. Choose TTLs with that in mind: for example 30 s for a heavy, slowly changing API, and no caching for
+data that must be exact.
+
+The endpoint-level result cache (`:cache` on the flow) is optional, and sits on top.
+
+### F3. Mandatory checks before a flow goes live
+
+When the config loads (startup or hot reload), every flow is checked. Any failure keeps the old version running:
+
+1. **Every SQL step has a timeout:** step `:tuning :timeout`, or the connection's `:defaults :timeout`.
+2. **Every SQL step has a row cap:** step `:max-rows`, flow `:limits :max-rows`, or the connection's `:defaults :max-rows`.
+3. **Explain runs and is archived.** Each SQL step whose flow version has no archived plan is explained
+   through the dialect (`EXPLAIN` / showplan) and written to
+   `<SPINDLE_EXPLAIN_DIR>/<flow>/<flow-version>/<step>.json`. The file holds the SQL, the dialect, the time and the plan.
+   - **Bind values:** from the flow's first `:examples` map for `[:params …]` paths; everything else is NULL.
+   - **SQL errors** (unknown column, syntax) **reject the reload.**
+   - **An unreachable database** does not reject it: the plan is retried on the next reload.
+
+There is no approval step. The archive gives DBAs a record of every plan that went live.
 
 ## 0. Summary
 
