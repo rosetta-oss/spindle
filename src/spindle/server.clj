@@ -1,6 +1,7 @@
 (ns spindle.server
   "HTTP: published endpoints, health, status, metrics, admin."
-  (:require [clojure.string :as str]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.tools.logging :as log]
             [jsonista.core :as json]
             [malli.core :as m]
@@ -217,6 +218,28 @@
 
       :else (json-resp 404 {:error {:code "not_found"}}))))
 
+;; --- console (static admin UI) ---
+
+(def ^:private console-types
+  {"html" "text/html; charset=utf-8" "js" "text/javascript; charset=utf-8" "css" "text/css; charset=utf-8"})
+
+(defn- console-resp [uri]
+  (let [rel (-> uri (subs (count "/console")) (str/replace #"^/" ""))
+        rel (if (str/blank? rel) "index.html" rel)
+        ext (last (str/split rel #"\."))
+        res (when (and (not (some #{".." "." ""} (str/split rel #"/" -1)))
+                       (re-matches #"[A-Za-z0-9_.\-/]+" rel)
+                       (contains? console-types ext))
+              (io/resource (str "console/" rel)))]
+    (if res
+      {:status 200
+       :headers {"Content-Type" (console-types ext)
+                 "Content-Security-Policy" "default-src 'self'"
+                 "Cache-Control" "no-store"
+                 "X-Content-Type-Options" "nosniff"}
+       :body (io/input-stream res)}
+      (json-resp 404 {:error {:code "not_found"}}))))
+
 (defn handler [{:keys [node-id config-dir store]}]
   (fn [req]
     (let [request-id (str (UUID/randomUUID))
@@ -233,6 +256,9 @@
             (json-resp 503 {:status "not_ready"}))
           (= uri "/metrics") {:status 200 :headers {"Content-Type" "text/plain; version=0.0.4"} :body (metrics/scrape)}
           (= uri "/status") (json-resp 200 (status-body node-id (admin? snap store req)))
+
+          (or (= uri "/console") (str/starts-with? uri "/console/"))
+          (if (web/secure? req) (console-resp uri) (web/insecure-resp))
 
           (and (str/starts-with? uri "/admin/tokens") (not (web/secure? req))) (web/insecure-resp)
 

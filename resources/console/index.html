@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spindle console</title>
+  <link rel="stylesheet" href="/console/console.css">
+</head>
+<body>
+  <section id="login" hidden>
+    <form id="login-form">
+      <h1>Spindle console</h1>
+      <label>Admin token <input id="login-token" type="password" autocomplete="off" required></label>
+      <button type="submit">Log in</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <header>
+      <div id="title"></div>
+      <div class="actions">
+        <button id="reload-btn" type="button">Reload</button>
+        <button id="logout-btn" type="button">Log out</button>
+      </div>
+    </header>
+    <nav id="tabs"></nav>
+    <p id="banner" class="error" role="alert"></p>
+    <main id="view"></main>
+  </div>
+
+  <dialog id="issue-dialog">
+    <form id="issue-form" method="dialog">
+      <h2>Issue token</h2>
+      <label>Name <input id="issue-id" required pattern="[a-z0-9][a-z0-9._\-]{1,62}" placeholder="alice-agent"></label>
+      <fieldset>
+        <legend>Scopes</legend>
+        <label><input type="checkbox" id="scope-author" value="spindle:author"> author</label>
+        <label><input type="checkbox" id="scope-admin"> <span id="scope-admin-label">admin</span></label>
+        <label><input type="checkbox" id="scope-delegate" value="spindle:delegate"> delegate
+          <span class="warn">Lets this token act for end users</span></label>
+        <label>Other scopes (space or comma separated) <input id="scope-extra"></label>
+      </fieldset>
+      <label>Expires (optional) <input id="issue-expiry" type="datetime-local"></label>
+      <p id="issue-error" class="error" role="alert"></p>
+      <div class="actions">
+        <button type="submit">Issue</button>
+        <button type="button" id="issue-cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="secret-dialog">
+    <h2>Token issued</h2>
+    <p>Copy it now. It will not be shown again.</p>
+    <code id="secret-value"></code>
+    <div class="actions">
+      <button type="button" id="secret-copy">Copy</button>
+      <button type="button" id="secret-close">Done</button>
+    </div>
+  </dialog>
+
+  <script src="/console/console.js"></script>
+</body>
+</html>

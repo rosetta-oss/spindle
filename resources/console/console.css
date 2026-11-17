@@ -1,0 +1,32 @@
+:root { --fg:#1d2430; --muted:#6b7686; --bg:#f6f7f9; --card:#fff; --line:#d9dee6; --accent:#2457c5; --bad:#b3261e; --ok:#1c7c3c; }
+* { box-sizing: border-box; }
+body { margin:0; font:14px/1.4 system-ui, sans-serif; color:var(--fg); background:var(--bg); }
+header { display:flex; justify-content:space-between; align-items:center; padding:.75rem 1rem; background:var(--card); border-bottom:1px solid var(--line); }
+nav { display:flex; gap:.25rem; padding:0 1rem; background:var(--card); border-bottom:1px solid var(--line); }
+nav button { border:0; background:none; padding:.6rem .9rem; cursor:pointer; color:var(--muted); border-bottom:2px solid transparent; }
+nav button.active { color:var(--fg); border-bottom-color:var(--accent); }
+main { padding:1rem; }
+button { font:inherit; padding:.35rem .8rem; border:1px solid var(--line); border-radius:4px; background:var(--card); cursor:pointer; }
+button.danger { color:var(--bad); border-color:var(--bad); }
+table { border-collapse:collapse; width:100%; background:var(--card); margin-bottom:1rem; }
+th, td { text-align:left; padding:.4rem .6rem; border-bottom:1px solid var(--line); vertical-align:top; }
+th { color:var(--muted); font-weight:600; }
+h2 { font-size:1rem; margin:1rem 0 .4rem; }
+.badge { display:inline-block; padding:0 .45rem; border-radius:9px; background:var(--line); font-size:12px; }
+.badge.pinned { background:#fde7b0; }
+.badge.closed, .badge.ok { background:#cdeed7; color:var(--ok); }
+.badge.open, .badge.bad { background:#f7d3d0; color:var(--bad); }
+.badge.half-open { background:#fde7b0; }
+.error { color:var(--bad); min-height:1.2em; margin:.25rem 1rem; }
+.warn { color:var(--bad); font-size:12px; display:block; }
+.muted, tr.revoked { color:var(--muted); }
+tr.revoked td:first-child { text-decoration:line-through; }
+.actions { display:flex; gap:.5rem; }
+#login { max-width:22rem; margin:15vh auto; background:var(--card); padding:1.5rem; border:1px solid var(--line); border-radius:6px; }
+#login label, dialog label { display:block; margin:.6rem 0; }
+#login input, dialog input:not([type=checkbox]) { display:block; width:100%; padding:.4rem; }
+dialog { border:1px solid var(--line); border-radius:6px; max-width:30rem; }
+fieldset { border:1px solid var(--line); margin:.6rem 0; }
+fieldset label { display:block; }
+code#secret-value { display:block; word-break:break-all; padding:.6rem; background:var(--bg); border:1px solid var(--line); margin:.6rem 0; }
+.inline { display:inline-flex; gap:.4rem; align-items:center; margin:.5rem 0; }
