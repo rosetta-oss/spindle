@@ -70,9 +70,14 @@
 (declare shape-rows)
 
 (defn- apply-spec [row spec results zone]
-  (let [row (if-let [{:keys [from on select]} (:merge spec)]
+  (let [row (if-let [{:keys [from on select pick]} (:merge spec)]
               (let [idx (index-by (get results from) on)
-                    m (first (get idx (left-key row on)))]
+                    ms (get idx (left-key row on))
+                    _ (when (and (next ms) (not= :first pick))
+                        (throw (ex-info (str "merge from " from " found " (count ms) " rows for " (pr-str (left-key row on))
+                                             "; use :nest for several, or :pick :first")
+                                        {:spindle/code :internal})))
+                    m (first ms)]
                 (merge row (if select (select-keys m select) (apply dissoc m (vals on)))))
               row)
         row (reduce (fn [r [k {:keys [from on one?] :as sub}]]

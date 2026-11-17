@@ -26,13 +26,33 @@
      [:all c ...] [:any c ...] [:not c]
 
    Numbers compare as decimals within the tolerance (default 0); dates and text
-   compare as they are."
+   compare as they are.
+
+   The same language is used for step conditions (:when [...]), where operands
+   are data paths instead of row fields:
+     [:exists [:cust]]   [:empty [:lines]]   [:> [:params :qty] 0]
+     [:all [:exists [:cust]] [:= [:cust :status] \"A\"]]
+   A path into a step yields its values: none → nil, one → that value, more →
+   the list (which then compares as unequal)."
   (:require [clojure.string :as str])
   (:import [java.math BigDecimal MathContext RoundingMode]))
 
 (def arithmetic #{:+ :- :* :/ :round :coalesce :if :concat :sum :count :get})
 (def comparisons #{:= :not= :< :<= :> :>=})
-(def logical #{:present :all :any :not})
+(def logical #{:present :exists :empty :all :any :not})
+
+(def operators (into (into arithmetic comparisons) logical))
+
+;; In step conditions, vectors starting with one of these roots are data paths,
+;; resolved by *resolve-path* (bound by the flow engine).
+(def ^:dynamic *path-roots* #{})
+(def ^:dynamic *resolve-path* nil)
+
+(defn- path? [e] (and (vector? e) (contains? *path-roots* (first e))))
+
+(defn- path-value [e]
+  (let [v (*resolve-path* e)]
+    (if (sequential? v) (case (count v) 0 nil 1 (first v) (vec v)) v)))
 
 (defn- dec* ^BigDecimal [x]
   (cond (nil? x) nil
@@ -41,7 +61,7 @@
         (string? x) (try (BigDecimal. (str/trim ^String x)) (catch NumberFormatException _ nil))
         :else nil))
 
-(defn- has? [v] (not (or (nil? v) (and (string? v) (str/blank? v)))))
+(defn has? [v] (not (or (nil? v) (and (string? v) (str/blank? v)))))
 
 (declare value check assert-problems)
 
@@ -52,6 +72,7 @@
   "Evaluate expression `e` over `row`."
   [e row]
   (cond
+    (path? e) (path-value e)
     (keyword? e) (get row e)
     (vector? e)
     (let [[op & args] e
@@ -99,6 +120,8 @@
           :unknown
           (if (try (compare* op a b (if (map? opts) opts {})) (catch ClassCastException _ false)) :pass :fail)))
       (= :present op) (if (every? #(has? (value % row)) args) :pass :fail)
+      (= :exists op) (if (has? (value (first args) row)) :pass :fail)
+      (= :empty op) (if (has? (value (first args) row)) :fail :pass)
       (= :all op) (let [rs (map #(check % row) args)]
                     (cond (some #{:fail} rs) :fail (some #{:unknown} rs) :unknown :else :pass))
       (= :any op) (let [rs (map #(check % row) args)]
@@ -114,6 +137,7 @@
   "Problems in an expression (as strings)."
   [e]
   (cond
+    (path? e) nil
     (vector? e)
     (let [[op & args] e]
       (cond
@@ -146,6 +170,15 @@
                                    (when (and opts (not (map? opts))) [(str op " options must be a map")])
                                    (expr-problems x) (expr-problems y)))
         (= :present op) (when (empty? args) [":present needs at least one field"])
+        (#{:exists :empty} op) (when-not (and (= 1 (count args)) (path? (first args)))
+                                 [(str op " takes one data path, e.g. [" op " [:cust]]")])
         (#{:all :any} op) (mapcat assert-problems args)
         (= :not op) (assert-problems (first args))
         :else [(str "unknown assertion " op " in " (pr-str a))]))))
+
+(defn paths-in
+  "Data paths used in a condition (with *path-roots* bound)."
+  [e]
+  (cond (path? e) [e]
+        (vector? e) (mapcat paths-in (rest e))
+        :else nil))

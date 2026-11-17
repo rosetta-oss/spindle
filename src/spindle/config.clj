@@ -88,52 +88,121 @@
 
 (def Connections [:map-of keyword? Connection])
 
+;; Flow schemas are closed: a misspelled key (:optinal, :chache, :selct) is a
+;; load error, never silently ignored. Flows are often written by agents.
+
 (def Path [:vector {:min 1} any?])
 
+(def StepCache
+  [:map {:closed true}
+   [:ttl [:or string? int?]]
+   [:stale {:optional true} [:or string? int?]]
+   [:stale-if-error {:optional true} [:or string? int?]]
+   [:per {:optional true} [:enum :caller]]
+   [:tags {:optional true} [:vector [:or keyword? string?]]]])
+
+(def EndpointCache
+  [:map {:closed true}
+   [:ttl [:or string? int?]]
+   [:stale {:optional true} [:or string? int?]]
+   [:stale-if-error {:optional true} [:or string? int?]]
+   [:empty-ttl {:optional true} [:or string? int?]]
+   [:max-entries {:optional true} pos-int?]])
+
+(def Request
+  [:map {:closed true}
+   [:method {:optional true} [:enum :get :post :put :patch :delete]]
+   [:path string?]
+   [:path-params {:optional true} [:map-of keyword? any?]]
+   [:query {:optional true} [:map-of [:or string? keyword?] any?]]
+   [:body {:optional true} [:map-of keyword? any?]]
+   [:headers {:optional true} [:map-of [:or string? keyword?] any?]]])
+
+(def Step
+  [:map {:closed true}
+   [:id keyword?]
+   [:kind [:enum :sql :api :http]]
+   [:conn keyword?]
+   [:doc {:optional true} string?]
+   [:in {:optional true} [:map-of keyword? Path]]
+   [:sql {:optional true} string?]
+   [:request {:optional true} Request]
+   [:rows {:optional true} string?]
+   [:fan-out {:optional true} Path]
+   [:or-else {:optional true} keyword?]
+   [:when {:optional true} [:or map? vector?]]
+   [:default {:optional true} any?]
+   [:cache {:optional true} StepCache]
+   [:optional {:optional true} boolean?]
+   [:skip-when-empty {:optional true} boolean?]
+   [:empty-on-404 {:optional true} boolean?]
+   [:max-rows {:optional true} pos-int?]
+   [:take {:optional true} [:or pos-int? [:vector any?]]]
+   [:tuning {:optional true} Defaults]])
+
+(def Output
+  [:schema {:registry
+            {::output [:map {:closed true}
+                       [:from {:optional true} keyword?]
+                       [:on {:optional true} [:map-of keyword? keyword?]]
+                       [:one? {:optional true} boolean?]
+                       [:merge {:optional true} [:map {:closed true}
+                                                 [:from keyword?]
+                                                 [:on [:map-of keyword? keyword?]]
+                                                 [:select {:optional true} [:vector keyword?]]
+                                                 [:pick {:optional true} [:enum :first]]]]
+                       [:nest {:optional true} [:map-of keyword? [:ref ::output]]]
+                       [:compute {:optional true} [:map-of keyword? any?]]
+                       [:derive {:optional true} [:or [:map-of keyword? any?] [:vector [:tuple keyword? any?]]]]
+                       [:assert {:optional true} [:vector vector?]]
+                       [:on-fail {:optional true} [:enum :flag :error]]
+                       [:types {:optional true} [:map-of keyword? keyword?]]
+                       [:select {:optional true} [:vector keyword?]]
+                       [:rename {:optional true} [:map-of keyword? keyword?]]]}}
+   ::output])
+
+(def Endpoint
+  [:map {:closed true}
+   [:path string?]
+   [:method {:optional true} [:enum :get :post]]
+   [:doc {:optional true} string?]
+   [:scopes {:optional true} [:set string?]]
+   [:caller {:optional true} [:enum :required :optional]]
+   [:batch {:optional true} [:map {:closed true} [:key keyword?] [:column {:optional true} keyword?]]]
+   [:page {:optional true} [:map {:closed true}
+                            [:key [:vector {:min 1} keyword?]]
+                            [:size {:optional true} pos-int?]
+                            [:max-size {:optional true} pos-int?]]]])
+
+(def View
+  [:map {:closed true}
+   [:doc {:optional true} string?]
+   [:output {:optional true} Output]
+   [:endpoint {:optional true} Endpoint]
+   [:cache {:optional true} EndpointCache]])
+
+(def flow-format 1)
+
 (def Flow
-  [:map
+  [:map {:closed true}
+   [:spindle/format {:optional true} [:= flow-format]]
+   [:spindle/view {:optional true} keyword?]
    [:doc {:optional true} string?]
    [:params {:optional true} any?]
-   [:steps {:optional true}
-    [:vector [:map
-              [:id keyword?]
-              [:kind [:enum :sql :api :http]]
-              [:conn keyword?]
-              [:in {:optional true} [:map-of keyword? Path]]
-              [:sql {:optional true} string?]
-              [:request {:optional true} map?]
-              [:rows {:optional true} string?]
-              [:fan-out {:optional true} Path]
-              [:or-else {:optional true} keyword?]
-              [:when {:optional true} map?]
-              [:default {:optional true} any?]
-              [:cache {:optional true} [:map [:ttl [:or string? int?]]
-                                        [:stale {:optional true} [:or string? int?]]
-                                        [:stale-if-error {:optional true} [:or string? int?]]
-                                        [:per {:optional true} [:enum :caller]]
-                                        [:tags {:optional true} [:vector [:or keyword? string?]]]]]
-              [:optional {:optional true} boolean?]
-              [:skip-when-empty {:optional true} boolean?]
-              [:empty-on-404 {:optional true} boolean?]
-              [:max-rows {:optional true} pos-int?]
-              [:take {:optional true} [:or pos-int? [:vector any?]]]
-              [:tuning {:optional true} Defaults]]]]
-   [:output {:optional true} map?]
+   [:steps {:optional true} [:vector Step]]
+   ;; shorthand: one SQL step
+   [:sql {:optional true} string?]
+   [:conn {:optional true} keyword?]
+   [:in {:optional true} [:map-of keyword? Path]]
+   [:output {:optional true} Output]
+   [:views {:optional true} [:map-of keyword? View]]
    [:parallel {:optional true} [:map-of keyword? pos-int?]]
-   [:cache {:optional true} map?]
-   [:limits {:optional true} [:map [:timeout {:optional true} [:or string? int?]]
+   [:cache {:optional true} EndpointCache]
+   [:limits {:optional true} [:map {:closed true}
+                              [:timeout {:optional true} [:or string? int?]]
                               [:max-rows {:optional true} pos-int?]]]
    [:examples {:optional true} [:vector map?]]
-   [:endpoint {:optional true}
-    [:map
-     [:path string?]
-     [:method {:optional true} [:enum :get :post]]
-     [:scopes {:optional true} [:set string?]]
-     [:caller {:optional true} [:enum :required :optional]]
-     [:batch {:optional true} [:map [:key keyword?] [:column {:optional true} keyword?]]]
-     [:page {:optional true} [:map [:key [:vector {:min 1} keyword?]]
-                              [:size {:optional true} pos-int?]
-                              [:max-size {:optional true} pos-int?]]]]]])
+   [:endpoint {:optional true} Endpoint]])
 
 ;; ---------------------------------------------------------------------------
 ;; reading
@@ -177,6 +246,19 @@
       (and old (= fp (:fingerprint old))) (conn/with-new-guards old cfg)
       :else (conn/open id cfg))))
 
+(defn- expand-views
+  "A flow file → [[flow-id raw] ...]. With :views, one flow per view: the shared
+   steps, params and limits, plus the view's own :output, :endpoint and :cache;
+   each view runs only the steps its output needs (spindle.flow/prune)."
+  [file id raw problems]
+  (if-let [views (:views raw)]
+    (if (or (:output raw) (:endpoint raw))
+      (do (swap! problems conj {:path [file] :message "a flow with :views puts :output and :endpoint inside each view"}) [])
+      (for [[vk v] views]
+        [(str id "/" (name vk))
+         (-> raw (dissoc :views) (merge (select-keys v [:output :endpoint :cache :doc])) (assoc :spindle/view vk))]))
+    [[id raw]]))
+
 (defn build
   "tree → {:snapshot s} or {:problems [...]}. `prev` is the running snapshot (or nil)."
   [tree prev]
@@ -193,20 +275,26 @@
         {conns :value missing :missing} (env/resolve-all (or conns-raw {}))
         _ (doseq [ref missing] (swap! problems conj {:path ["connections.edn"] :message (str "unresolved ${" ref "}")}))
         flow-files (filter #(and (str/starts-with? % "flows/") (str/ends-with? % ".edn")) (keys tree))
+        flow-defs (for [f flow-files
+                        :let [id (-> f (subs 6) (str/replace #"\.edn$" ""))
+                              raw (read-edn f (get tree f) problems)
+                              sql-text (get tree (str/replace f #"\.edn$" ".sql"))]
+                        :when raw
+                        :let [e (m/explain Flow raw)]
+                        :when (or (not e)
+                                  (do (swap! problems conj {:path [f] :message (pr-str (me/humanize e))}) false))
+                        [vid vraw] (expand-views f id raw problems)]
+                    {:file f :id vid :raw vraw :sql-text sql-text})
+        _ (doseq [[vid n] (frequencies (map :id flow-defs)) :when (> n 1)]
+            (swap! problems conj {:path ["flows"] :message (str "flow id " vid " is defined twice (a file and a view?)")}))
         flows (into {}
-                    (for [f flow-files
-                          :let [id (-> f (subs 6) (str/replace #"\.edn$" ""))
-                                raw (read-edn f (get tree f) problems)
-                                sql-text (get tree (str/replace f #"\.edn$" ".sql"))
-                                blocks (when sql-text (sqlfile/parse-blocks sql-text))]
-                          :when raw]
-                      (if-let [e (m/explain Flow raw)]
-                        (do (swap! problems conj {:path [f] :message (pr-str (me/humanize e))}) nil)
-                        (let [{:keys [flow] ps :problems} (try (flow/compile-flow id raw blocks conns)
-                                                               (catch Exception e {:problems [{:path [f] :message (.getMessage e)}]}))]
-                          (if ps
-                            (do (swap! problems into ps) nil)
-                            [id (assoc flow :version (tree-version {f (get tree f) :sql sql-text}))])))))
+                    (for [{:keys [file id raw sql-text]} flow-defs
+                          :let [blocks (when sql-text (sqlfile/parse-blocks sql-text))
+                                {:keys [flow] ps :problems} (try (flow/compile-flow id raw blocks conns)
+                                                                 (catch Exception e {:problems [{:path [file] :message (.getMessage e)}]}))]]
+                      (if ps
+                        (do (swap! problems into ps) nil)
+                        [id (assoc flow :version (tree-version {file (get tree file) :sql sql-text}))])))
         flows (into {} (remove nil?) flows)
         endpoints (->> flows
                        (keep (fn [[id fl]] (when-let [ep (:endpoint fl)]

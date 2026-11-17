@@ -19,7 +19,7 @@
 (defn resolve-path
   "→ the value for `path` given request `params`, `caller` and step `results`
    ({step-id rows-or-value})."
-  [path {:keys [params caller results fan page]}]
+  [path {:keys [params caller results fan page strict]}]
   (let [[root & more] path]
     (case root
       :params (get-in params more)
@@ -28,6 +28,13 @@
       :caller (get-in caller more)
       (let [rows (get results root)
             rows (if (sequential? rows) rows (when (some? rows) [rows]))]
+        ;; SQL rows always carry every column: a path naming a column none of
+        ;; them has is a typo in the flow, not "no value"
+        (when (and (contains? strict root) (seq more) (seq rows) (map? (first rows))
+                   (not-any? #(contains? % (first more)) rows))
+          (throw (ex-info (str "step " root " has no column " (first more)
+                               " (columns: " (pr-str (vec (keys (first rows)))) ")")
+                          {:spindle/code :internal :path path})))
         (->> rows
              (map #(get-in % more))
              (mapcat #(if (sequential? %) % [%]))

@@ -24,6 +24,7 @@
             [spindle.httpstep :as httpstep]
             [spindle.output :as output]
             [spindle.paths :as paths]
+            [spindle.result :as result]
             [spindle.sql :as sql]
             [spindle.sqlfile :as sqlfile]
             [spindle.stepcache :as stepcache])
@@ -46,8 +47,11 @@
 ;;   {:all [c ...]}  {:any [c ...]}  {:not c}
 ;; ---------------------------------------------------------------------------
 
+(def ^:private path-roots-base #{:params :caller :page :fan})
+
 (defn- cond-paths [c]
   (cond
+    (vector? c) (result/paths-in c)          ; *path-roots* bound by compile-flow
     (:exists c) [(:exists c)]
     (:empty c) [(:empty c)]
     (:= c) [(first (:= c))]
@@ -69,6 +73,9 @@
 
 (defn eval-cond [c env]
   (cond
+    (vector? c) (binding [result/*path-roots* (into path-roots-base (:step-ids env))
+                          result/*resolve-path* #(paths/resolve-path % env)]
+                  (= :pass (result/check c {})))
     (:exists c) (present? (paths/resolve-path (:exists c) env))
     (:empty c) (not (present? (paths/resolve-path (:empty c) env)))
     (:= c) (let [[p v] (:= c) x (paths/resolve-path p env)]
@@ -98,10 +105,31 @@
         :else (recur (into {} (map (fn [[id ds]] [id (set/difference ds ready)]))
                            (apply dissoc deps ready)))))))
 
+(defn- output-sources [spec]
+  (concat [(:from spec)] (some-> spec :merge :from vector)
+          (mapcat (fn [[_ sub]] (output-sources sub)) (:nest spec))))
+
+(defn prune
+  "Keep the steps the output reads, their dependencies and their fallbacks."
+  [steps out-spec]
+  (loop [keep #{} todo (set (remove nil? (output-sources out-spec)))]
+    (if-let [id (first todo)]
+      (let [st (get steps id)
+            more (remove keep (concat (:deps st) (some-> st :or-else vector)))]
+        (recur (conj keep id) (into (disj todo id) more)))
+      (select-keys steps keep))))
+
+(declare compile-flow*)
+
 (defn compile-flow
   "→ {:flow compiled} or {:problems [...]}.
    `raw` is the flow EDN, `blocks` the .sql blocks, `conns` {id resolved-config}."
   [flow-id raw blocks conns]
+  (binding [result/*path-roots* (into path-roots-base
+                                      (map :id (or (:steps raw) (when (:sql raw) [{:id :main}]))))]
+    (compile-flow* flow-id raw blocks conns)))
+
+(defn- compile-flow* [flow-id raw blocks conns]
   (let [problems (atom [])
         add! (fn [path msg] (swap! problems conj (problem (into [flow-id] path) msg)))
         steps-raw (or (:steps raw)
@@ -125,9 +153,13 @@
                                    :caller-dependent? caller?
                                    ;; a caller-dependent step is always cached per caller
                                    :step-cache (when cache-s (cond-> cache-s caller? (assoc :per :caller)))})]
-                  (when (and (:when s) (not (valid-cond? (:when s))))
+                  (when (vector? (:when s))
+                    (doseq [p (result/assert-problems (:when s))] (add! [:steps id :when] p)))
+                  (when (and (map? (:when s)) (not (valid-cond? (:when s))))
                     (add! [:steps id :when] "invalid condition; use {:exists path} {:empty path} {:= [path v]} {:all [..]} {:any [..]} {:not c}"))
                   (when-not (keyword? id) (add! [:steps] "every step needs a keyword :id"))
+                  (when (or (result/operators id) (path-roots-base id))
+                    (add! [:steps id] (str "step id " id " is reserved (an operator or a path root); rename the step")))
                   (when-not ccfg (add! [:steps id :conn] (str "unknown connection " conn)))
                   (doseq [dep (:deps base) :when (not (ids dep))]
                     (add! [:steps id] (str "refers to unknown step " dep)))
@@ -160,7 +192,9 @@
                            (when-not (get-in base [:tuning :timeout])
                              (add! [:steps id :tuning :timeout]
                                    "every SQL step needs a timeout (step :tuning :timeout or the connection's :defaults :timeout)"))
-                           (let [mr (or (:max-rows s) (get-in base [:tuning :max-rows]) (get-in raw [:limits :max-rows]))]
+                           ;; precedence: step :max-rows > step :tuning > flow :limits > connection :defaults
+                           (let [mr (or (:max-rows s) (get-in s [:tuning :max-rows]) (get-in raw [:limits :max-rows])
+                                        (get-in ccfg [:defaults :max-rows]))]
                              (when-not mr
                                (add! [:steps id :max-rows]
                                      "every SQL step needs a row cap (:max-rows on the step, the flow's :limits, or the connection's :defaults)"))
@@ -168,7 +202,10 @@
                      :http
                      (do (when (and ccfg (not= :http (:type ccfg)))
                            (add! [:steps id :conn] "an :http step needs an :http connection"))
-                         (when (not (#{:get :post nil} (get-in s [:request :method])))
+                         (when-let [rp (:rows s)]
+                           (when-not (re-matches #"\$(\.[A-Za-z_][A-Za-z0-9_-]*|\[\*\])*" rp)
+                             (add! [:steps id :rows] (str "unsupported JSON path " rp "; use $, $.a.b, $[*], $.a[*].b"))))
+                         (when-not (contains? #{:get :post nil} (get-in s [:request :method]))
                            (add! [:steps id :request :method] "only GET/POST reads are allowed for now"))
                          base)
                      (do (add! [:steps id :kind] (str "unknown step kind " kind " (use :sql or :api)")) base))])))
@@ -201,8 +238,10 @@
     (if (seq @problems)
       {:problems @problems}
       {:flow {:id flow-id
+              :view (:spindle/view raw)
               :params-schema params-schema
-              :steps compiled
+              ;; a view runs only the steps its output needs
+              :steps (if (:spindle/view raw) (prune compiled out-spec) compiled)
               :output out-spec
               :deadline-ms deadline-ms
               :parallel (:parallel raw)
@@ -326,7 +365,7 @@
                      ;; :take caps the rows returned (a number or a [:params ...] path)
                      take (let [t (:take step)] (if (vector? t) (paths/resolve-path t env) t))]
                  (if (and empty (:skip-when-empty step))
-                   []
+                   (:default step)
                    (cached step flow-id env [(:sql-text step) (into (sorted-map) values) take]
                            #(sql/run-step! rt step values (cond-> ctx (pos-int? take) (assoc :take take))))))
           :http (let [env (cond-> env (seq (get-in rt [:cfg :forward-caller])) (assoc :forward-caller (get-in rt [:cfg :forward-caller])))]
@@ -345,7 +384,9 @@
   (let [deadline-ns (+ (System/nanoTime) (* 1000000 (:deadline-ms flow)))
         trace (when trace? (atom {}))
         env (cond-> {:params params :caller caller :deadline-ns deadline-ns :parallel (:parallel flow)
-                     :page page :flow-version (:version flow) :request-id request-id}
+                     :page page :flow-version (:version flow) :request-id request-id
+                     :step-ids (set (keys (:steps flow)))
+                     :strict (set (keep (fn [[id st]] (when (= :sql (:kind st)) id)) (:steps flow)))}
               no-cache? (assoc :no-cache? true)
               trace (assoc :trace trace))
         run1 (fn [step env cancels] (run-step snapshot (:id flow) request-id env step env cancels))

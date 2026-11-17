@@ -11,42 +11,37 @@ and what to watch out for. Patterns marked *roadmap* use features that are desig
   `[:caller :claims :territory_id]`. There are no string templates.
 - **Every SQL step needs a timeout and a row cap.** Put them on the connection's `:defaults` once and override per step if needed.
 - **Prefer caching heavy API steps for a short time** (for example `{:ttl "30s"}`) over adding endpoint caches.
+- **Keys are checked.** Flow, step, output and endpoint maps are closed: a misspelled key (`:optinal`, `:selct`)
+  rejects the reload. Start each file with `:spindle/format 1`.
+- **One language for logic.** Step conditions (`:when`), derived fields (`:derive`) and checks (`:assert`) all use
+  `[:op …]` vectors. In `:when`, operands are data paths; in the result stage, keywords are the row's fields.
 
 ---
 
-## 1. Projection: split one heavy API into small endpoints
+## 1. Projection: split one heavy API into small endpoints (`:views`)
 
 **When to use it:** an upstream returns header and details together, but callers need them separately
 (a graph asks for the header first and the lines later, or both at once).
 
 ```clojure
-;; flows/orders/header.edn
-{:params [:map [:id pos-int?]]
+;; flows/orders/order.edn → flows orders/order/header and orders/order/lines
+{:spindle/format 1
+ :params [:map [:id pos-int?]]
  :steps [{:id :order :kind :api :conn :orders_api
           :request {:method :get :path "/orders/{id}" :path-params {:id [:params :id]}}
-          :rows "$.header"
           :cache {:ttl "30s" :stale-if-error "5m"}}]
- :output {:from :order :one? true}
- :endpoint {:path "/orders/{id}/header" :scopes #{"orders:read"}}}
-
-;; flows/orders/lines.edn — same :request, different projection
-{:params [:map [:id pos-int?]]
- :steps [{:id :order :kind :api :conn :orders_api
-          :request {:method :get :path "/orders/{id}" :path-params {:id [:params :id]}}
-          :rows "$.details[*]"
-          :cache {:ttl "30s"}}]
- :output {:from :order :select [:line :sku :qty]}
- :endpoint {:path "/orders/{id}/lines" :scopes #{"orders:read"}}}
+ :views {:header {:output {:from :order :one? true :select [:header]}
+                  :endpoint {:path "/orders/{id}/header" :scopes #{"orders:read"}}}
+         :lines  {:output {:from :order :select [:details]}
+                  :endpoint {:path "/orders/{id}/lines" :scopes #{"orders:read"}}}}}
 ```
 
-**Why it works:** the step cache key is the connection plus the resolved request, and it stores the response *body*.
-The `:rows` projection runs after the cache, so both endpoints share one entry, and single-flight merges
-concurrent calls. The upstream sees one call per order per TTL.
+**Why it works:** the steps are written once. Each view becomes its own flow (`<file>/<view>`) that runs only the
+steps its output reads. The step cache stores the response *body*, keyed by connection and resolved request, so
+both views share one entry, and single-flight merges concurrent calls: one upstream call per order per TTL.
+(Two separate flows with identical `:request` maps share the entry too; `:views` just avoids the copy.)
 
-**Watch out:**
-
-- Keep the `:request` maps identical, or the endpoints get different cache keys.
-- If the upstream answer depends on the user, see pattern 5.
+**Watch out:** if the upstream answer depends on the user, see pattern 5.
 
 ## 2. Conditional enrichment: SQL first, API only when needed
 
@@ -56,7 +51,7 @@ concurrent calls. The upstream sees one call per order per TTL.
 {:params [:map [:id string?]]
  :steps [{:id :cust :kind :sql :conn :erp :in {:id [:params :id]}}
          {:id :credit :kind :api :conn :credit_api
-          :when {:exists [:cust]}                     ; skipped → :default (default [])
+          :when [:exists [:cust]]                     ; skipped → :default (default [])
           :request {:method :get :path "/credit/{id}" :path-params {:id [:cust :customer_id]}}
           :rows "$"}]
  :output {:from :cust :one? true
@@ -64,8 +59,13 @@ concurrent calls. The upstream sees one call per order per TTL.
  :endpoint {:path "/customers/{id}/with-credit" :scopes #{"customers:read"}}}
 ```
 
-**Conditions:** `{:exists p}`, `{:empty p}`, `{:= [p v]}`, `{:all [..]}`, `{:any [..]}`, `{:not c}`.
-A skipped step returns its `:default`, which is `[]` unless you set it. The output keeps the same shape either way.
+**Conditions** use the `[:op …]` language with data paths as operands:
+`[:exists p]`, `[:empty p]`, `[:= p v]`, `[:> p v]` (and `:< :<= :>= :not=`), `[:all c …]`, `[:any c …]`, `[:not c]`.
+For example `[:all [:exists [:cust]] [:= [:cust :status] "A"]]`. A path into a step gives its value when there is
+exactly one. The older map form (`{:exists p}`) still loads.
+
+A skipped step returns its `:default`, which is `[]` unless you set it. The same holds when a step is skipped because
+an input list is empty. The output keeps the same shape either way.
 
 ## 3. Batch expansion: many ids in one call
 
@@ -86,7 +86,10 @@ select order_id, customer_id, total from orders where order_id in :order_id
 
 - `?order_id=1,2,3` and JSON arrays both work. Semalith's api connector sends the comma form.
 - `IN` lists are chunked per dialect (ASE 250, PostgreSQL 1000).
-- Rows echo the key, so the caller can regroup them.
+- Callers send `POST /api/_batch/<endpoint-id>` with `{"order_id": [1, 2, 3]}` (or `"1,2,3"`). With an endpoint
+  `:cache`, keys already cached are not fetched again; `meta.batch` says how many were.
+- Rows must echo the key (`:batch {:key :order_id :column :salesorderid}` when the column is named differently),
+  so the caller can regroup them.
 
 **Watch out:** on ASE, very long `IN` lists hurt plans. Keep `:max` modest. Staging the ids in a temp table
 is on the roadmap.
@@ -104,6 +107,26 @@ is on the roadmap.
 `:or-else` runs the fallback only when the primary returns no rows. Consumers of `:hdr` then see the
 fallback's rows. If some keys of a batch are current and others archived, use one block with `union all`
 instead.
+
+## 4b. Keyset paging
+
+```clojure
+{:steps [{:id :orders :kind :sql :conn :erp
+          :in {:after [:page :after_order_id] :limit [:page :limit]}}]
+ :endpoint {:path "/orders" :page {:key [:order_id] :size 50 :max-size 500}}}
+```
+
+```sql
+-- :name orders
+select order_id, customer_id from orders
+ where (cast(:after as int) is null or order_id > :after)
+ order by order_id
+ limit :limit
+```
+
+`[:page :limit]` is the page size + 1, so Spindle can tell whether there is a next page. `[:page :after_<key>]` is
+NULL on the first page. The response carries `next`; callers pass it back as `?after=`, and `?size=` asks for a
+smaller page, up to `:max-size`. On ASE, write `top` or `set rowcount` instead of `limit`.
 
 ## 5. Per-user data: identity passthrough
 
@@ -173,6 +196,29 @@ per caller, so one user's rows are never served to another.
 - **`:take`** (a number or a `[:params …]` path) returns at most that many rows. The driver stops reading at N (`setMaxRows`; jConnect sends `set rowcount`). It is capped by the step's row cap and never fails with "row cap exceeded". ASE does not accept a parameter in `top`, so keep a fixed `top` as the ceiling.
 - **Paging:** pass the last row's `order_no` as `before` for the next page. Every page is an index range, so later pages stay fast and new rows cause no duplicates.
 
+## 8b. Finalize the result: derive and check
+
+```clojure
+:output {:from :order :one? true
+         :nest   {:lines {:from :lines :on {:salesorderid :salesorderid}
+                          :derive [[:amount [:round [:* :orderqty :unitprice] 2]]]}}
+         :derive [[:lines_total [:sum :lines :amount]]
+                  [:line_count  [:count :lines]]]
+         :assert [[:= :subtotal :lines_total {:tolerance 0.01}]
+                  [:present :customerid]]
+         :on-fail :flag}
+```
+
+- **Expressions:** `:+ :- :* :/ :round :coalesce :if :concat`, and over nested rows `[:sum :part :f]`,
+  `[:count :part]`, `[:get :part :f]`. `+` sums what is present; the others need every operand.
+- **Assertions:** `:= :not= :< :<= :> :>=` (numbers within `:tolerance`), `:present`, `:all :any :not`. Each is
+  pass, fail or unknown (a value it needs is missing).
+- **`:on-fail :flag`** lists failures in `meta.checks`; **`:error`** fails the request with `assertion_failed` (502).
+- **`:merge`** takes exactly one matching row. Several matches are an error; use `:nest`, or `:pick :first` when
+  any one will do.
+- Callers with scope `spindle:trace` can add `?trace=true` to see, per step, its kind, connection, time, rows,
+  cache state and whether it was skipped.
+
 ## 9. Raw search results merged with SQL and API (*roadmap*: `:search`)
 
 ```clojure
@@ -194,6 +240,8 @@ Query DSL is EDN data, with data paths at value positions. ES|QL takes `?` param
 ## Checklist before publishing
 
 - [ ] Does the flow fetch one business object? If not, split it and let the graph compose.
+- [ ] Does the file start with `:spindle/format 1`, and does it reload without problems?
+- [ ] Several projections of one source? Use `:views`, not copies of the same steps.
 - [ ] Do all SQL steps have a timeout and a row cap?
 - [ ] Is there an `:examples` entry, so that explain uses realistic values?
 - [ ] Are heavy API steps cached briefly, and do the endpoints share identical `:request` maps?
