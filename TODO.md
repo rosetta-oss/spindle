@@ -25,12 +25,14 @@ Where work continues after 2026-11-17. Everything up to `04110f7` was built and 
       deadline cancels at the step timeout anyway (flow 504 after ~5.4 s, nothing left running).
 - [x] **Explain:** showplan with `set noexec on` during reload; check the archived plan in `SPINDLE_EXPLAIN_DIR`.
       2026-11-17: the integration test archives a showplan on reload and it passes on dev ASE.
-- [ ] **`:proc`:**
-  - [ ] several result sets named with `:results`;
-  - [ ] return status with `:status` / `:fail-on-status :non-zero`;
-  - [ ] OUT parameters;
-  - [ ] an undeclared extra result set fails;
-  - [ ] measure `IGNORE_DONE_IN_PROC` (row counts from procedures).
+- [ ] **`:proc`:** (2026-11-17, read-only with system procedures on dev ASE; integration test covers them)
+  - [x] several result sets named with `:results` (`sp_helpindex`: 3 sets);
+  - [x] return status with `:status` / `:fail-on-status :non-zero` (`sp_getmessage` of an unknown number → 1 → 502);
+  - [x] OUT parameters (`sp_getmessage` → `{:msg "timeouts" :status 0}`);
+  - [x] an undeclared extra result set fails ("procedure returned 3 result sets; the step names 2");
+  - [x] `IGNORE_DONE_IN_PROC`: with jConnect's default the in-procedure row counts hide the result sets and
+        multi-set procedures fail. The ASE dialect now sets it to `true` by default.
+  - [ ] a procedure of our own (needs the test database), including the transaction-mode item below.
 - [ ] **Writes (mutation endpoints):**
   - [ ] update + read-back in one transaction;
   - [ ] rollback on failure;

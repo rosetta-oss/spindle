@@ -237,6 +237,8 @@ per caller, so one user's rows are never served to another.
 - **PostgreSQL:** a set-returning function is simplest as `:sql` (`select * from f(:id)`); a `CREATE PROCEDURE`
   needs `:procedure true` (native `CALL`; OUT values come back as its row).
 - A procedure counts as a write unless `:read-only true`; writing procedures belong in mutation endpoints.
+- **ASE:** the dialect sets jConnect's `IGNORE_DONE_IN_PROC=true`; without it the row counts of statements inside a
+  procedure hide its result sets. Don't turn it off in `:properties`.
 
 ## 8d. Writes (mutation endpoints)
 

@@ -61,7 +61,9 @@
     ;; timeout only stops reading; the statement keeps running on the server.
     ;; QUERY_TIMEOUT_CANCELS_ALL=true makes the timeout cancel it. A connection's
     ;; :properties still override this.
-    :property-defaults {"QUERY_TIMEOUT_CANCELS_ALL" "true"}
+    ;; IGNORE_DONE_IN_PROC=true: without it the row counts of statements inside a
+    ;; procedure hide its result sets (verified: sp_helpindex fails as :proc).
+    :property-defaults {"QUERY_TIMEOUT_CANCELS_ALL" "true" "IGNORE_DONE_IN_PROC" "true"}
     :isolation? true :transactions? true :procedures? true
     :max-in 250
     :explain :showplan

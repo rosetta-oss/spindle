@@ -718,7 +718,7 @@ jConnect properties Spindle uses:
 | `CANCEL_ALL`, `QUERY_TIMEOUT_CANCELS_ALL` | cancel scope; verified on ASE 2026-11-17: `QUERY_TIMEOUT_CANCELS_ALL=true` is the dialect default (otherwise a query timeout leaves the statement running) |
 | `DYNAMIC_PREPARE` | ASE statement cache; to be measured |
 | `SELECT_OPENS_CURSOR`, `IMPLICIT_CURSOR_FETCH_SIZE` | only these make `:fetch-size` take effect on ASE |
-| `IGNORE_DONE_IN_PROC` | row counts from procedures |
+| `IGNORE_DONE_IN_PROC` | row counts from procedures; verified on ASE 2026-11-17: `true` is the dialect default (otherwise a procedure's result sets are hidden) |
 | `CHARSET`, `LANGUAGE` | character set and message language |
 
 ASE tuning notes for the guide:

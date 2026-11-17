@@ -176,6 +176,16 @@
       (write! dir "flows/it/qtimeout.edn" (pr-str {:steps [{:id :s :kind :sql :conn :ase :sql ase-slow :tuning {:timeout "1s"}}]
                                                     :limits {:timeout "10s"}
                                                     :endpoint {:path "/it/qtimeout" :scopes #{"it"}}}))
+      ;; :proc on system procedures (read-only, nothing created on the server)
+      (doseq [[nm step out] [["idx" {:call "sp_helpindex" :args [:t] :in {:t [:params :t]} :results [:indexes :partitions :attrs]} {:from :indexes}]
+                             ["idx2" {:call "sp_helpindex" :args [:t] :in {:t [:params :t]} :results [:indexes]} {:from :indexes}]
+                             ["msg" {:call "sp_getmessage" :args [:n {:out :msg :type :varchar}] :in {:n [:params :n]}
+                                     :status :status :fail-on-status :non-zero} nil]]]
+        (write! dir (str "flows/it/" nm ".edn")
+                (pr-str (cond-> {:params [:map [:t {:optional true} :string] [:n {:optional true} :int]]
+                                 :steps [(merge {:id :s :kind :proc :conn :ase :read-only true} step)]
+                                 :endpoint {:path (str "/it/" nm) :scopes #{"it"}}}
+                          out (assoc :output out)))))
       (is (= nil (:problems (config/reload! (str dir)))))
       (let [h (server/handler {:node-id "it" :config-dir (str dir)})
             ds {:jdbcUrl (env "SPINDLE_IT_ASE_URL") :user (env "SPINDLE_IT_ASE_USER") :password (env "SPINDLE_IT_ASE_PASSWORD")}
@@ -196,5 +206,14 @@
             (is (= 504 (:status r)))
             (is (< ms 5000) (str "returned after " ms " ms"))
             (is (wait-until #(zero? (busy)) 3000) "no spindle spid still running a command")))
+        (testing ":proc — named result sets (needs IGNORE_DONE_IN_PROC, the dialect default)"
+          (let [r (call h :get "/it/idx" "t=sysobjects")]
+            (is (= 200 (:status r)) (pr-str (:json r)))
+            (is (seq (get-in r [:json :rows])))))
+        (testing ":proc — an undeclared extra result set fails"
+          (is (= 502 (:status (call h :get "/it/idx2" "t=sysobjects")))))
+        (testing ":proc — OUT parameter and return status"
+          (is (= [{:msg "timeouts" :status 0}] (get-in (call h :get "/it/msg" "n=17000") [:json :rows])))
+          (is (= 502 (:status (call h :get "/it/msg" "n=1999999999")))))
         (testing "the pool still serves reads after a cancel"
           (is (= [{:one 1 :s "x"}] (get-in (call h :get "/it/read") [:json :rows]))))))))
