@@ -1,9 +1,17 @@
 (ns spindle.output
-  "Shaping step results into one output. Order per row:
-   merge → nest → compute → types → select → rename."
+  "Shaping step results into one output — the flow's final result stage.
+   Order per row: merge → nest → compute (SCI) → derive ([:op ...]) → types →
+   assert → select → rename.
+
+   :derive  {field expr} or [[field expr] ...] (in order; later fields may use
+            earlier ones) — see spindle.result
+   :assert  [assertion ...] over each top-level output row, before select
+   :on-fail :flag (default: failures are listed in meta.checks) | :error
+            (the request fails with code assertion_failed)"
   (:require [clojure.set]
             [clojure.string :as str]
-            [spindle.expr :as expr])
+            [spindle.expr :as expr]
+            [spindle.result :as result])
   (:import [java.math BigDecimal]
            [java.time LocalDate LocalDateTime OffsetDateTime ZoneId Instant]))
 
@@ -29,9 +37,24 @@
       :nil-if-blank (if (and (string? v) (str/blank? v)) nil v)
       v)))
 
+(defn- derive-pairs [d] (if (map? d) (seq d) d))
+
+(defn spec-problems
+  "Problems in the declarative parts of an output spec (recursively), as strings."
+  [spec]
+  (concat
+   (for [[k e] (derive-pairs (:derive spec))
+         p (if (keyword? k) (result/expr-problems e) [(str "derive key must be a keyword: " (pr-str k))])]
+     (str "derive " k ": " p))
+   (for [a (:assert spec) p (result/assert-problems a)] (str "assert: " p))
+   (when-not (contains? #{nil :flag :error} (:on-fail spec)) [":on-fail is :flag or :error"])
+   (mapcat (fn [[_ s]] (spec-problems s)) (:nest spec))))
+
 (defn compile-spec
   "Compile :compute expressions inside an output spec (recursively)."
   [spec]
+  (when-let [ps (seq (spec-problems spec))]
+    (throw (ex-info (str/join "; " ps) {:problems ps})))
   (cond-> spec
     (:compute spec) (assoc ::compute (into {} (map (fn [[k form]] [k (expr/compile-expr form)])) (:compute spec)))
     (:nest spec) (update :nest #(into {} (map (fn [[k s]] [k (compile-spec s)])) %))
@@ -58,18 +81,30 @@
                         (assoc r k (if one? (first kids) (vec kids)))))
                     row (:nest spec))
         row (reduce (fn [r [k f]] (assoc r k (f r))) row (::compute spec))
+        row (reduce (fn [r [k e]] (assoc r k (result/value e r))) row (derive-pairs (:derive spec)))
         row (reduce (fn [r [k t]] (if (contains? r k) (update r k #(coerce t % zone)) r)) row (:types spec))
-        row (if-let [s (:select spec)] (select-keys row (concat s (keys (:nest spec)))) row)
+        row (if-let [as (seq (::top-assert spec))]
+              (assoc row ::checks (vec (for [a as :let [r (result/check a row)] :when (not= :pass r)]
+                                         {:assert a :result r})))
+              row)
+        row (if-let [s (:select spec)] (select-keys row (concat s (keys (:nest spec)) [::checks])) row)
         row (if-let [rn (:rename spec)] (clojure.set/rename-keys row rn) row)]
     row))
 
 (defn shape-rows [rows spec results zone]
   (mapv #(apply-spec % spec results zone) rows))
 
-(defn shape
-  "→ vector of output rows (or one row / nil with :one?)."
+(defn shape-with-checks
+  "→ {:rows vector-or-one-row :checks [{:row i :assert a :result :fail|:unknown}]}."
   [spec results zone]
   (let [rows (get results (:from spec))
         rows (if (sequential? rows) rows (if (nil? rows) [] [rows]))
-        out (shape-rows rows spec results zone)]
-    (if (:one? spec) (first out) out)))
+        out (shape-rows rows (assoc spec ::top-assert (:assert spec)) results zone)
+        checks (vec (for [[i r] (map-indexed vector out) c (::checks r)] (assoc c :row i)))
+        out (mapv #(dissoc % ::checks) out)]
+    {:rows (if (:one? spec) (first out) out) :checks checks}))
+
+(defn shape
+  "→ vector of output rows (or one row / nil with :one?)."
+  [spec results zone]
+  (:rows (shape-with-checks spec results zone)))

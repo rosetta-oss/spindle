@@ -13,6 +13,7 @@
    :unavailable 503
    :timeout 504
    :source_error 502
+   :assertion_failed 502
    :internal 500})
 
 (defn fail!

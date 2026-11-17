@@ -236,22 +236,42 @@
     (-> request
         (update :query rv) (update :path-params rv) (update :body #(when % (rv %))) (update :headers rv))))
 
+(defn- note!
+  "Add facts to this step's trace entry (when the request is traced)."
+  [env step m]
+  (when-let [t (:trace env)] (swap! t update (:id step) merge m)))
+
 (defn- cached
   "Run `compute` through the step cache when the step has :cache settings."
   [step flow-id env cache-payload compute]
   (if-let [s (when-not (:no-cache? env) (:step-cache step))]
     (let [k [(:conn step) (:kind step) cache-payload
-             (when (= :caller (:per s)) (stepcache/caller-scope (:caller env)))]]
-      (:rows (stepcache/lookup k s [flow-id (name (:id step))] compute)))
+             (when (= :caller (:per s)) (stepcache/caller-scope (:caller env)))]
+          {:keys [rows cache]} (stepcache/lookup k s [flow-id (name (:id step))] compute)]
+      (note! env step {:cache cache})
+      rows)
     (compute)))
 
+(declare run-step-kind)
+
 (defn- run-step [snapshot flow-id tag-id {:keys [deadline-ns]} step env cancels]
-  (let [rt (get-in snapshot [:conns (:conn step)])
-        ctx {:deadline-ns deadline-ns :cancels cancels :tag (str flow-id "#" (name (:id step)) " " tag-id)}
-        t0 (System/nanoTime)]
+  (let [ctx {:deadline-ns deadline-ns :cancels cancels :tag (str flow-id "#" (name (:id step)) " " tag-id)}
+        t0 (System/nanoTime)
+        outcome (volatile! "error")]
     (try
       (if (and (:when step) (not (eval-cond (:when step) env)))
-        (:default step)                       ; skipped: a stable, declared value
+        (do (vreset! outcome "skipped")
+            (:default step))                  ; skipped: a stable, declared value
+        (let [v (run-step-kind snapshot flow-id step env ctx)]
+          (vreset! outcome "ok")
+          v))
+      (finally
+        (let [ns (- (System/nanoTime) t0)]
+          (note! env step {:kind (name (:kind step)) :conn (name (:conn step)) :start t0 :ms (quot ns 1000000) :outcome @outcome})
+          (spindle.metrics/timer! "spindle_step_seconds" {:endpoint flow-id :step (name (:id step)) :kind (name (:kind step))} ns))))))
+
+(defn- run-step-kind [snapshot flow-id step env ctx]
+  (let [rt (get-in snapshot [:conns (:conn step)])]
         (case (:kind step)
           :sql (let [{:keys [values empty]} (sql-values step env)
                      ;; :take caps the rows returned (a number or a [:params ...] path)
@@ -265,39 +285,44 @@
                    step
                    (cached step flow-id env [(resolve-request (:request step) env)
                                              (when-let [f (:fan-out step)] (paths/resolve-path f env))]
-                           #(httpstep/fetch! rt step env ctx))))))
-      (finally
-        (spindle.metrics/timer! "spindle_step_seconds" {:endpoint flow-id :step (name (:id step)) :kind (name (:kind step))}
-                                (- (System/nanoTime) t0))))))
+                           #(httpstep/fetch! rt step env ctx)))))))
 
 (defn execute
-  "Run a compiled flow. → {:rows .. :partial [...]}
+  "Run a compiled flow. → {:rows .. :partial [...] :checks [...] :trace [...]?}
    :no-cache? bypasses the step cache (neither read nor filled);
+   :trace? collects, per step, kind, connection, ms, outcome and cache state;
    :on-step (fn [step-id rows ms]) is called after each successful step."
-  [snapshot flow params {:keys [caller request-id no-cache? on-step]}]
+  [snapshot flow params {:keys [caller request-id no-cache? on-step trace?]}]
   (let [deadline-ns (+ (System/nanoTime) (* 1000000 (:deadline-ms flow)))
+        trace (when trace? (atom {}))
         env (cond-> {:params params :caller caller :deadline-ns deadline-ns :parallel (:parallel flow)}
-              no-cache? (assoc :no-cache? true))
+              no-cache? (assoc :no-cache? true)
+              trace (assoc :trace trace))
         run1 (fn [step env cancels] (run-step snapshot (:id flow) request-id env step env cancels))
         {:keys [results partial]}
         (executor/run (:steps flow)
-                      (if on-step
-                        (fn [step env cancels]
-                          (let [t0 (System/nanoTime) rows (run1 step env cancels)]
-                            (on-step (:id step) rows (quot (- (System/nanoTime) t0) 1000000))
-                            rows))
-                        run1)
+                      (fn [step env cancels]
+                        (let [t0 (System/nanoTime) rows (run1 step env cancels)]
+                          (when trace (swap! trace update (:id step) assoc :rows (if (sequential? rows) (count rows) (if (nil? rows) 0 1))))
+                          (when on-step (on-step (:id step) rows (quot (- (System/nanoTime) t0) 1000000)))
+                          rows))
                       env)
         zone (some (fn [[_ s]] (get-in snapshot [:conns (:conn s) :cfg :zone])) (:steps flow))
         ;; shaping runs SCI expressions: bound by the remaining deadline
         remaining-ms (max 1 (quot (- deadline-ns (System/nanoTime)) 1000000))
-        fut (future (output/shape (:output flow) results zone))
-        rows (try (.get ^java.util.concurrent.Future fut remaining-ms TimeUnit/MILLISECONDS)
-                  (catch TimeoutException _
-                    (future-cancel fut)
-                    (err/fail! :timeout "output shaping exceeded the deadline"))
-                  (catch ExecutionException e
-                    (let [c (.getCause e)]
-                      (if (:spindle/code (ex-data c)) (throw c)
-                          (err/fail! :internal "output shaping failed" {} c)))))]
-    {:rows rows :partial partial}))
+        fut (future (output/shape-with-checks (:output flow) results zone))
+        {:keys [rows checks]}
+        (try (.get ^java.util.concurrent.Future fut remaining-ms TimeUnit/MILLISECONDS)
+             (catch TimeoutException _
+               (future-cancel fut)
+               (err/fail! :timeout "output shaping exceeded the deadline"))
+             (catch ExecutionException e
+               (let [c (.getCause e)]
+                 (if (:spindle/code (ex-data c)) (throw c)
+                     (err/fail! :internal "output shaping failed" {} c)))))]
+    (when (and (seq checks) (= :error (get-in flow [:output :on-fail])))
+      (err/fail! :assertion_failed (str (count checks) " assertion(s) did not pass") {:checks checks}))
+    (cond-> {:rows rows :partial partial :checks checks}
+      trace (assoc :trace (vec (for [[id m] (sort-by (comp :start val) @trace)]
+                                 (cond-> (-> m (dissoc :start) (assoc :step (name id)))
+                                   (:cache m) (update :cache name))))))))

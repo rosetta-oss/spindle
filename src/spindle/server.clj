@@ -39,14 +39,17 @@
     :body (json/write-value-as-string body mapper)}))
 
 (defn- error-resp [e request-id]
-  (let [{code :spindle/code :keys [step retry-after-s]} (or (err/code-of e) {:spindle/code :internal})
+  (let [{code :spindle/code :keys [step retry-after-s checks outcome committed]} (or (err/code-of e) {:spindle/code :internal})
         status (err/http-status code 500)]
     (when (= code :internal) (log/error e "internal error"))
     (json-resp status
                {:error (cond-> {:code (name code) :message (or (some-> (err/code-of e) :spindle/message)
                                                                (.getMessage ^Throwable e))
                                 :request_id request-id}
-                         step (assoc :step (name step)))}
+                         step (assoc :step (name step))
+                         (seq checks) (assoc :checks (mapv #(update % :result name) checks))
+                         outcome (assoc :outcome (name outcome))
+                         (seq committed) (assoc :committed (mapv name committed)))}
                (when retry-after-s {"Retry-After" (str retry-after-s)}))))
 
 ;; ---------------------------------------------------------------------------
@@ -70,6 +73,8 @@
                [(java.net.URLDecoder/decode ^String k "UTF-8") (java.net.URLDecoder/decode (str v) "UTF-8")]))
     {}))
 
+(def trace-scope "spindle:trace")
+
 (defn- run-endpoint [snap store ep match req request-id who]
   (let [caller (auth/authenticate (:auth snap) store req)]
     (vreset! who (:id caller))
@@ -78,9 +83,15 @@
     (when (and (= :required (:caller ep)) (not (:sub caller)))
       (err/fail! :unauthenticated "this endpoint needs the end user (X-Spindle-User)"))
     (let [fl (get-in snap [:flows (:flow ep)])
-          params (flow/coerce-params (:params-schema fl) (request-params (assoc req :query-params (query-string-params req)) match))
-          compute #(flow/execute snap fl params {:caller caller :request-id request-id})
-          c (get-in snap [:caches (:id ep)])
+          raw (request-params (assoc req :query-params (query-string-params req)) match)
+          ;; ?trace=true: how each step ran, for callers holding spindle:trace (or admin)
+          trace? (and (= "true" (str (:trace raw)))
+                      (or (auth/allowed? caller #{trace-scope})
+                          (auth/allowed? caller #{(get-in snap [:auth :admin-scope] "spindle:admin")})))
+          params (flow/coerce-params (:params-schema fl) (dissoc raw :trace))
+          t0 (System/nanoTime)
+          compute #(flow/execute snap fl params {:caller caller :request-id request-id :trace? trace?})
+          c (when-not trace? (get-in snap [:caches (:id ep)]))
           {:keys [value] cache-state :cache} (if c
                                               ;; the endpoint cache is per caller whenever any step depends on the caller
                                               (cache/lookup c [(:version fl) params
@@ -90,8 +101,11 @@
       (when (= cache-state :stale) (metrics/counter! "spindle_cache_stale_served_total" {:endpoint (:id ep)}))
       {:body {:rows (:rows value)
               :next nil
-              :meta {:endpoint (:id ep) :config_version (:version snap) :flow_version (:version fl)
-                     :cache (name cache-state) :partial (mapv #(update (update % :step name) :code name) (:partial value))}}})))
+              :meta (cond-> {:endpoint (:id ep) :config_version (:version snap) :flow_version (:version fl)
+                             :cache (name cache-state) :elapsed_ms (quot (- (System/nanoTime) t0) 1000000)
+                             :partial (mapv #(update (update % :step name) :code name) (:partial value))}
+                      (seq (:checks value)) (assoc :checks (mapv #(update % :result name) (:checks value)))
+                      (:trace value) (assoc :trace (:trace value)))}})))
 
 ;; ---------------------------------------------------------------------------
 ;; status
