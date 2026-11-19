@@ -142,6 +142,15 @@
   }
   function renderData(s) {
     var d = $('data');
+    // Endpoints only changes when the config, the open definition or the filter does: rebuilding it
+    // on every poll would reset the reader's scroll position in the list and the definition.
+    if (state.tab === 'Endpoints') {
+      var def = (state.epDefs || {})[state.epOpen] || {};
+      var key = [(s.config || {}).version, (s.endpoints || []).length, state.epOpen, state.epFilter,
+                 def.loading ? 'l' : def.error ? 'e' : def.edn ? 'd' : '-'].join('|');
+      if (d.firstChild && state.epKey === key) return;
+      state.epKey = key;
+    } else state.epKey = null;
     d.textContent = '';
     var f = { Overview: overview, Activity: activityTab, Connections: connections, Endpoints: endpoints, 'Try it': function () { return document.createTextNode(''); },
               Caches: caches, Config: configTab, Tokens: tokensTab }[state.tab];
