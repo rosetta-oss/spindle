@@ -18,6 +18,8 @@
   executor fixes for `:optional` + `:or-else` and fallback dependencies.
 - **Result stage:** `:derive`, `:assert` with `:on-fail`, `?trace=true`.
 - **Read path:** batch route `POST /api/_batch/<id>`, keyset paging, `GET /openapi.json`, slow-step log.
+- **Compound batch keys:** `:batch {:key … :group-by [...]}` accepts a JSON array of items (one per compound key,
+  as Semalith's API `:batch` sends), runs the flow once per group and checks rows echo every key part (2026-11-19).
 - **`:proc` steps:** OUT parameters, return status, named result sets, cursors; PostgreSQL procedures via native CALL.
 - **Writes:** mutation endpoints with one transaction per connection, `:expect`, `Idempotency-Key`, audit, `:evicts`.
 - **Auth:** JWT bearer tokens from configured issuers (nimbus-jose-jwt).

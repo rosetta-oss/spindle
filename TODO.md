@@ -75,7 +75,8 @@ Where work continues after 2026-11-17. Everything up to `04110f7` was built and 
 ## 4. Instruction set: next improvements (from the 2026-11-17 review)
 
 - [ ] **Composite keys in data paths:** `[:lines [:order_id :line_no]]` → pairs; on ASE expand to `OR`-ed pairs
-      or a temp table.
+      or a temp table. 2026-11-19: done for the batch route instead (`:batch {:group-by [...]}`, cookbook §3a), which
+      covers a graph sending compound parent keys. Data paths between steps are still single-column.
 - [ ] **Expressions as `:in` values** (`[:op …]`), for values computed between steps.
 - [ ] **`:examples` with expected results:** run them on publish (like dossier's sample checks); lint paths
       and output fields against the columns seen.

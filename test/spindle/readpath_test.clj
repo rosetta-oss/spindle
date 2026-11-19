@@ -23,6 +23,10 @@
           ds {:jdbcUrl (str "jdbc:sqlite:" db)}]
       (jdbc/execute! ds ["create table orders (id integer primary key, customer text)"])
       (doseq [i (range 1 26)] (jdbc/execute! ds ["insert into orders values (?, ?)" i (str "C-" (mod i 3))]))
+      ;; order 1 exists as type 1 and type 2: a compound key (order_no, order_type) keeps them apart
+      (jdbc/execute! ds ["create table order_lines (order_no integer, order_type integer, line_no integer, qty integer)"])
+      (doseq [[o t l q] [[1 1 1 10] [1 1 2 11] [1 2 1 20] [2 2 1 30] [3 1 1 40]]]
+        (jdbc/execute! ds ["insert into order_lines values (?, ?, ?, ?)" o t l q]))
       (reset! config/state {:snapshot nil :history [] :last-reload nil :pinned false})
       (stepcache/clear!)
       (binding [*dir* (io/file root "config")
@@ -36,6 +40,11 @@
                                   :sql "select id, customer from orders where id in :ids order by id"}]
                          :cache {:ttl "30s"}
                          :endpoint {:path "/orders" :scopes #{"read"} :batch {:key :id}}}))
+        (write! "flows/orders/lines.edn"
+                (pr-str {:params '[:map [:order_no [:vector {:min 1 :max 3} pos-int?]] [:order_type pos-int?]]
+                         :steps [{:id :l :kind :sql :conn :db :in {:nos [:params :order_no] :typ [:params :order_type]}
+                                  :sql "select order_no, order_type, line_no, qty from order_lines where order_no in :nos and order_type = :typ order by order_no, line_no"}]
+                         :endpoint {:path "/orders/lines" :scopes #{"read"} :batch {:key :order_no :group-by [:order_type]}}}))
         (write! "flows/orders/list.edn"
                 (pr-str {:params '[:map [:customer {:optional true} string?]]
                          :steps [{:id :o :kind :sql :conn :db
@@ -68,6 +77,43 @@
   (testing "GET is refused, unknown ids are 404"
     (is (= 405 (:status (call :get "/api/_batch/orders/by-id"))))
     (is (= 404 (:status (call :post "/api/_batch/orders/list" {:id [1]}))))))
+
+(deftest batch-compound-key
+  (testing "an array of (order_no, order_type) items: one run per order_type, rows echo both parts"
+    (let [r (call :post "/api/_batch/orders/lines" [{:order_no 1 :order_type 1} {:order_no 1 :order_type 2} {:order_no 2 :order_type 2}])
+          rows (get-in r [:json :rows])]
+      (is (= 200 (:status r)) (pr-str (:json r)))
+      (is (= #{[1 1 10] [1 1 11] [1 2 20] [2 2 30]} (set (map (juxt :order_no :order_type :qty) rows))))
+      (is (= {:keys 3 :cached 0 :fetched 3 :groups 2} (get-in r [:json :meta :batch])))))
+  (testing "only the pairs asked for: (1, 1) and (2, 2) do not bring back (1, 2)"
+    (let [rows (get-in (call :post "/api/_batch/orders/lines" [{:order_no 1 :order_type 1} {:order_no 2 :order_type 2}]) [:json :rows])]
+      (is (= #{[1 1] [2 2]} (set (map (juxt :order_no :order_type) rows))))))
+  (testing "the map form still works: a list of keys with one order_type"
+    (is (= #{3 1} (set (map :order_no (get-in (call :post "/api/_batch/orders/lines" {:order_no [1 3] :order_type 1}) [:json :rows]))))))
+  (testing "items are checked: both parts required, nothing else, at most the key list's :max"
+    (is (= 422 (:status (call :post "/api/_batch/orders/lines" [{:order_no 1}]))))
+    (is (= 422 (:status (call :post "/api/_batch/orders/lines" [{:order_no 1 :order_type 1 :qty 5}]))))
+    (is (= 422 (:status (call :post "/api/_batch/orders/lines" []))))
+    (is (= 422 (:status (call :post "/api/_batch/orders/lines" (for [i (range 1 5)] {:order_no i :order_type 1}))))
+        "4 items, the key list allows 3"))
+  (testing "OpenAPI offers both body shapes"
+    (let [doc (:json (call :get "/openapi.json"))
+          sch (get-in doc [:paths (keyword "/api/_batch/orders/lines") :post :requestBody :content :application/json :schema])]
+      (is (= 2 (count (:oneOf sch))))
+      (is (= ["order_no" "order_type"] (get-in sch [:oneOf 1 :items :required]))))))
+
+(deftest batch-group-by-is-checked-on-load
+  (write! "flows/orders/bad.edn"
+          (pr-str {:params '[:map [:order_no [:vector pos-int?]] [:kinds [:vector pos-int?]]]
+                   :steps [{:id :l :kind :sql :conn :db :in {:nos [:params :order_no]}
+                            :sql "select order_no from order_lines where order_no in :nos"}]
+                   :endpoint {:path "/orders/bad" :scopes #{"read"} :batch {:key :order_no :group-by [:order_type :kinds :order_no]}}}))
+  (let [r (config/reload! (str *dir*))
+        msgs (set (map :message (:problems r)))]
+    (is (not (:ok r)))
+    (is (some #(str/includes? % "order_type must be a parameter") msgs) (pr-str msgs))
+    (is (some #(str/includes? % "kinds takes one value per item") msgs))
+    (is (some #(str/includes? % "is the batch key itself") msgs))))
 
 (deftest keyset-paging
   (let [p1 (call :get "/orders/all")

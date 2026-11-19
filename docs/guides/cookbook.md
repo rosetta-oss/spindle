@@ -94,6 +94,35 @@ select order_id, customer_id, total from orders where order_id in :order_id
 **Watch out:** on ASE, very long `IN` lists hurt plans. Keep `:max` modest. Staging the ids in a temp table
 is on the roadmap.
 
+### 3a. Compound keys: `:group-by`
+
+**When to use it:** the key has two parts, such as an order number and an order type (the same number can be a
+sales order and a purchase order). A graph sends one item per parent.
+
+```clojure
+{:params [:map [:order_no [:vector {:min 1 :max 100} pos-int?]] [:order_type pos-int?]]
+ :steps [{:id :lines :kind :sql :conn :erp :in {:order_no [:params :order_no] :order_type [:params :order_type]}}]
+ :endpoint {:path "/api/orders/lines" :scopes #{"sales:read"} :batch {:key :order_no :group-by [:order_type]}}}
+```
+
+```sql
+-- :name lines
+select order_no, order_type, line_no, qty from order_lines where order_no in :order_no and order_type = :order_type
+```
+
+**How it works:**
+
+- `POST /api/_batch/<endpoint-id>` also takes a JSON array of items:
+  `[{"order_no": 1, "order_type": 1}, {"order_no": 1, "order_type": 2}]`. This is the shape Semalith's API `:batch`
+  sends for a compound parent key (a root-array `json_body`).
+- Items are grouped by the `:group-by` fields; the flow runs once per group with the key as a list
+  (`order_no in (…) and order_type = 1`, then `… = 2`). A batch usually holds one or two types, so one or two runs.
+- Only the pairs asked for come back: `(1, 1)` and `(2, 2)` never bring back `(1, 2)`.
+- Items carry exactly the key and the `:group-by` fields, all of them; anything else is refused (422). One call takes
+  at most the key list's `:max` items (500 when the schema has none).
+- Rows must echo the key and every `:group-by` field. Query-string parameters apply to every group.
+- The map form still works for one group: `{"order_no": [1, 3], "order_type": 1}`.
+
 ## 4. Current table, else archive
 
 **When to use it:** a row lives in a current table or, once it is old, in an archive table.

@@ -190,7 +190,8 @@
    [:evicts {:optional true} [:vector [:or keyword? string?]]]
    [:scopes {:optional true} [:set string?]]
    [:caller {:optional true} [:enum :required :optional]]
-   [:batch {:optional true} [:map {:closed true} [:key keyword?] [:column {:optional true} keyword?]]]
+   [:batch {:optional true} [:map {:closed true} [:key keyword?] [:column {:optional true} keyword?]
+                                   [:group-by {:optional true} [:vector {:min 1} keyword?]]]]
    [:page {:optional true} [:map {:closed true}
                             [:key [:vector {:min 1} keyword?]]
                             [:size {:optional true} pos-int?]

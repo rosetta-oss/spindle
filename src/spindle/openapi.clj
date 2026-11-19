@@ -84,9 +84,22 @@
      :security [{"bearer" (vec (sort scopes))} {"apiKey" (vec (sort scopes))}]
      :requestBody {:required true
                    :content {"application/json"
-                             {:schema {:type "object"
-                                       :properties (into {} (map (fn [e] [(name (:name e)) (:schema e)])) es)
-                                       :required [(name (:key batch))]}}}}
+                             {:schema (let [obj {:type "object"
+                                                 :properties (into {} (map (fn [e] [(name (:name e)) (:schema e)])) es)
+                                                 :required [(name (:key batch))]}
+                                            by-name (into {} (map (fn [e] [(:name e) (:schema e)])) es)
+                                            fields (cons (:key batch) (:group-by batch))]
+                                        (if (seq (:group-by batch))
+                                          ;; compound key: also an array of items, one per key
+                                          {:oneOf [obj {:type "array"
+                                                        :items {:type "object"
+                                                                :properties (into {} (for [f fields]
+                                                                                       [(name f) (if (= f (:key batch))
+                                                                                                   (or (:items (by-name f)) {})
+                                                                                                   (by-name f))]))
+                                                                :required (mapv name fields)
+                                                                :additionalProperties false}}]}
+                                          obj))}}}
      :responses (responses)}))
 
 (defn- oa-path [p] p)

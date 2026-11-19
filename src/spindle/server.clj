@@ -4,6 +4,7 @@
             [clojure.string :as str]
             [clojure.tools.logging :as log]
             [jsonista.core :as json]
+            [malli.core :as m]
             [reitit.core :as r]
             [ring.adapter.jetty9 :as jetty]
             [spindle.activity :as activity]
@@ -165,19 +166,50 @@
 ;; The key is a list (JSON array or "1,2,3"); the flow runs once for the keys the
 ;; endpoint cache does not hold, rows are split per key (by :column, default the
 ;; key) and cached per key, so single and batch calls share entries.
+;;
+;; Compound keys (order_no + order_type): with :batch {:key :order_no :group-by [:order_type]}
+;; the body may also be a JSON array of items, [{"order_no": 1, "order_type": 2} ...] (what
+;; Semalith's API :batch sends for a compound parent key). Items are grouped by the
+;; :group-by fields and the flow runs once per group with the key as a list; rows must
+;; echo the key and every :group-by field so the caller can regroup them. Query-string
+;; parameters apply to every group.
 
 (def batch-prefix "/api/_batch/")
 
-(defn- run-batch [snap store ep req request-id who]
-  (let [caller (authorize! snap store ep req who)
-        fl (get-in snap [:flows (:flow ep)])
-        {bk :key col :column} (:batch ep)
+(defn- batch-max
+  "At most this many keys in one batch call: the key list's :max, else 500."
+  [fl bk]
+  (or (some (fn [[k _ sch]] (when (= k bk) (:max (m/properties sch))))
+            (some-> (:params-schema fl) m/children))
+      500))
+
+(defn- batch-groups
+  "The request as groups of raw parameters, each with the key as a list. A map body (or
+   none) is one group; an array body is grouped by the :group-by fields."
+  [{bk :key gb :group-by} qp body cap]
+  (if (sequential? body)
+    (let [fields (set (cons bk gb))
+          items (vec (distinct body))]
+      (when (empty? items) (err/fail! :input_rejected "batch body is an empty list"))
+      (when (> (count items) cap) (err/fail! :input_rejected (str "at most " cap " items in one batch call")))
+      (doseq [it items]
+        (when-not (map? it) (err/fail! :input_rejected "batch items must be objects"))
+        (when-let [extra (seq (remove fields (keys it)))]
+          (err/fail! :input_rejected (str "batch items take only " (str/join ", " (map name (sort fields)))
+                                          "; unexpected: " (str/join ", " (map name extra)))))
+        (when-let [absent (seq (remove #(contains? it %) fields))]
+          (err/fail! :input_rejected (str "every batch item needs " (str/join ", " (map name absent))))))
+      (for [g (distinct (map #(dissoc % bk) items))]
+        (merge qp g {bk (mapv bk (filter #(= g (dissoc % bk)) items))})))
+    [(merge qp (when (map? body) body))]))
+
+(defn- run-batch-group
+  "One flow run for one group's keys, through the endpoint cache."
+  [snap fl ep params caller request-id]
+  (let [{bk :key col :column gb :group-by} (:batch ep)
         col (or col bk)
-        raw (request-params (assoc req :query-params (query-string-params req)) nil)
-        params (flow/coerce-params (:params-schema fl) (dissoc raw :trace))
         ks (vec (distinct (get params bk)))
         _ (when (empty? ks) (err/fail! :input_rejected (str "batch key " (name bk) " is empty")))
-        t0 (System/nanoTime)
         c (get-in snap [:caches (:id ep)])
         key-of (fn [k] (cache-key fl (assoc params bk [k]) caller nil))
         hits (if c (into {} (keep (fn [k] (when-let [v (cache/peek-fresh c (key-of k))] [k v]))) ks) {})
@@ -187,12 +219,29 @@
         by-key (group-by #(get % col) (:rows value))]
     (when (and c value (empty? (:partial value)) (empty? (:checks value)))
       (doseq [k missing] (cache/put! c (key-of k) {:rows (vec (get by-key k [])) :partial [] :checks []})))
-    (when (and value (some #(not (contains? % col)) (:rows value)))
-      (err/fail! :internal (str "batch rows must echo the key column " (name col))))
-    {:body {:rows (vec (mapcat #(if-let [h (hits %)] (:rows h) (get by-key %)) ks))
+    (doseq [f (cons col gb)]
+      (when (and value (some #(not (contains? % f)) (:rows value)))
+        (err/fail! :internal (str "batch rows must echo the " (if (= f col) "key column " "group-by column ") (name f)))))
+    {:rows (vec (mapcat #(if-let [h (hits %)] (:rows h) (get by-key %)) ks))
+     :keys (count ks) :cached (count hits) :fetched (count missing) :value value}))
+
+(defn- run-batch [snap store ep req request-id who]
+  (let [caller (authorize! snap store ep req who)
+        fl (get-in snap [:flows (:flow ep)])
+        {bk :key} (:batch ep)
+        qp (into {} (map (fn [[k v]] [(keyword k) v])) (query-string-params req))
+        body (when (:body req) (let [s (slurp (:body req))] (when-not (str/blank? s) (json/read-value s read-mapper))))
+        t0 (System/nanoTime)
+        groups (batch-groups (:batch ep) (dissoc qp :trace) (if (map? body) (dissoc body :trace) body) (batch-max fl bk))
+        runs (mapv #(run-batch-group snap fl ep (flow/coerce-params (:params-schema fl) %) caller request-id) groups)
+        values (keep :value runs)
+        merged {:rows (vec (mapcat :rows runs)) :partial (vec (mapcat :partial values)) :checks (vec (mapcat :checks values))}
+        [nk nc nf] (map #(reduce + (map % runs)) [:keys :cached :fetched])]
+    {:body {:rows (:rows merged)
             :next nil
-            :meta (-> (meta-of snap ep fl (or value {}) (cond (empty? missing) :hit (empty? hits) (if c :miss :none) :else :partial) t0)
-                      (assoc :batch {:keys (count ks) :cached (count hits) :fetched (count missing)}))}}))
+            :meta (-> (meta-of snap ep fl merged (cond (zero? nf) :hit (zero? nc) (if (get-in snap [:caches (:id ep)]) :miss :none) :else :partial) t0)
+                      (assoc :batch (cond-> {:keys nk :cached nc :fetched nf}
+                                      (sequential? body) (assoc :groups (count runs)))))}}))
 
 ;; ---------------------------------------------------------------------------
 ;; status

@@ -328,11 +328,19 @@
     (doseq [[id st] compiled :when (and (:expect st) (not (:write? st)))]
       (add! [:steps id :expect] ":expect is for write steps"))
     ;; batch: the key is a list parameter; rows must be regroupable by it
-    (when-let [{bk :key} (get-in raw [:endpoint :batch])]
+    (when-let [{bk :key gb :group-by} (get-in raw [:endpoint :batch])]
       (let [entries (when (and params-schema (= :map (m/type params-schema))) (m/children params-schema))
             ks (some (fn [[k _ sch]] (when (= k bk) sch)) entries)]
         (when-not (and ks (#{:vector :sequential :set} (m/type ks)))
           (add! [:endpoint :batch :key] (str "batch key " bk " must be a list parameter in :params, e.g. [" bk " [:vector {:max 500} pos-int?]]")))
+        ;; :group-by: the other parts of a compound key (order_no + order_type): one value per item, one run per group
+        (doseq [g gb]
+          (let [sch (some (fn [[k _ sch]] (when (= k g) sch)) entries)]
+            (cond
+              (= g bk) (add! [:endpoint :batch :group-by] (str g " is the batch key itself"))
+              (nil? sch) (add! [:endpoint :batch :group-by] (str "group-by field " g " must be a parameter in :params"))
+              (#{:vector :sequential :set} (m/type sch))
+              (add! [:endpoint :batch :group-by] (str "group-by field " g " takes one value per item, not a list")))))
         (when (get-in raw [:output :one?]) (add! [:endpoint :batch] "a batch endpoint returns rows; drop :one? from :output"))))
     ;; keyset paging: rows (never :one?), size within the row cap, and a step that binds [:page :limit]
     (when-let [{:keys [size max-size] :or {size 50 max-size 500}} (get-in raw [:endpoint :page])]
