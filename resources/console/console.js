@@ -134,7 +134,7 @@
     var view = $('view');
     view.textContent = '';
     var c = el('div', { id: 'controls' });
-    var builder = { Activity: activityControls, Caches: cacheControls, Tokens: tokenControls, 'Try it': tryControls }[state.tab];
+    var builder = { Endpoints: endpointControls, Activity: activityControls, Caches: cacheControls, Tokens: tokenControls, 'Try it': tryControls }[state.tab];
     if (builder) builder(c);
     view.appendChild(c);
     view.appendChild(el('div', { id: 'data' }));
@@ -180,20 +180,49 @@
   }
   // Endpoints: click a path to see its definition (parameters, the flow's .edn with its
   // comments, the .sql). Definitions are fetched once and kept, so polling does not refetch.
+  function endpointControls(c) {
+    var q = el('input', { type: 'search', class: 'ep-search', placeholder: 'Filter by path or flow', autocomplete: 'off' });
+    q.value = state.epFilter || '';
+    q.addEventListener('input', function () { state.epFilter = q.value; if (state.status) renderData(state.status); });
+    c.appendChild(q);
+  }
+  function epGroups(eps) {
+    var key2 = function (p) { return '/' + p.split('/').filter(Boolean).slice(0, 2).join('/'); };
+    var n = {};
+    eps.forEach(function (e) { var k = key2(e.path); n[k] = (n[k] || 0) + 1; });
+    var groups = {};
+    eps.forEach(function (e) {
+      var k = n[key2(e.path)] > 1 ? key2(e.path) : '/' + (e.path.split('/').filter(Boolean)[0] || '');
+      (groups[k] = groups[k] || []).push(e);
+    });
+    return Object.keys(groups).sort().map(function (k) { return { name: k, eps: groups[k] }; });
+  }
   function endpoints(s) {
-    var wrap = el('div');
     var ver = (s.config || {}).version;
     if (state.epDefsVer !== ver) { state.epDefs = {}; state.epDefsVer = ver; fetchDef(state.epOpen); } // a reload changes definitions
-    var eps = (s.endpoints || []).slice().sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0; });
-    wrap.appendChild(table(['Method', 'Path', 'Flow'], eps.map(function (e) {
-      var open = state.epOpen === e.id;
-      return { cls: open ? 'flagged' : null,
-               cells: [String(dash(e.method)).toUpperCase(),
-                       el('button', { class: 'link', text: e.path, title: 'Show the definition',
-                                      onclick: function () { openEndpoint(open ? null : e.id); } }),
-                       e.id] };
-    })));
-    if (state.epOpen) wrap.insertBefore(endpointDetail(state.epOpen), wrap.firstChild);
+    var f = (state.epFilter || '').trim().toLowerCase();
+    var eps = (s.endpoints || []).filter(function (e) {
+      return !f || e.path.toLowerCase().indexOf(f) >= 0 || String(e.id).toLowerCase().indexOf(f) >= 0;
+    }).sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0; });
+    var list = el('div', { class: 'ep-list' });
+    list.appendChild(el('div', { class: 'ep-count muted', text: eps.length + ' of ' + (s.endpoints || []).length + ' endpoints' }));
+    epGroups(eps).forEach(function (g) {
+      var card = el('div', { class: 'ep-group' }, [el('div', { class: 'ep-group-name' }, [g.name, el('span', { class: 'ep-n', text: String(g.eps.length) })])]);
+      g.eps.forEach(function (e) {
+        var open = state.epOpen === e.id;
+        var rest = e.path.indexOf(g.name) === 0 && e.path !== g.name ? e.path.slice(g.name.length) : e.path;
+        card.appendChild(el('button', { class: 'ep-row' + (open ? ' active' : ''), title: 'Show the definition',
+                                        onclick: function () { openEndpoint(open ? null : e.id); } }, [
+          el('span', { class: 'ep-method m-' + String(e.method).toLowerCase(), text: String(dash(e.method)).toUpperCase() }),
+          el('span', { class: 'ep-path' }, rest === e.path ? [el('b', { text: e.path })]
+                                                           : [el('span', { class: 'muted', text: g.name }), el('b', { text: rest })]),
+          el('span', { class: 'ep-flow', text: e.id })]));
+      });
+      list.appendChild(card);
+    });
+    if (!eps.length) list.appendChild(el('p', { class: 'muted', text: 'No endpoint matches.' }));
+    var wrap = el('div', { class: 'ep-layout' + (state.epOpen ? ' with-detail' : '') }, [list]);
+    if (state.epOpen) wrap.appendChild(endpointDetail(state.epOpen));
     return wrap;
   }
   function fetchDef(id) {
@@ -208,7 +237,6 @@
     state.epOpen = id;
     fetchDef(id);
     render();
-    if (id) window.scrollTo(0, 0);
   }
   function schemaText(sc) {
     if (!sc) return '—';
@@ -436,6 +464,14 @@
     tok.value = state.callToken;
     tok.addEventListener('input', function () { state.callToken = tok.value.trim(); });
     var op = ops.filter(function (o) { return o.path === state.tryPath; })[0].op;
+    // default test values: the flow's first :example, unless something was typed already
+    var ex = (op['x-spindle-examples'] || [])[0];
+    if (ex && !Object.keys(state.tryValues).some(function (k) { return state.tryValues[k]; })) {
+      Object.keys(ex).forEach(function (k) {
+        var v = ex[k];
+        state.tryValues[k] = Array.isArray(v) ? v.join(',') : (v == null ? '' : String(v));
+      });
+    }
     var fields = (op.parameters || []).filter(function (p) { return p.in === 'query'; }).map(function (p) {
       var sc = p.schema || {};
       var hint = [sc.type, sc.description, sc.minimum != null ? 'min ' + sc.minimum : null,
@@ -540,7 +576,14 @@
   // /console/dev-token hands it over; one click logs in and Try it calls with it too.
   function checkDev() {
     fetch('/console/dev-token').then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (b) { state.devToken = (b && b.token) || ''; $('dev-login').hidden = !state.devToken; })
+      .then(function (b) {
+        state.devToken = (b && b.token) || ''; $('dev-login').hidden = !state.devToken;
+        // still logged in with the dev token after a page reload: Try it calls with it by default
+        if (state.devToken && !state.callToken && getToken() === state.devToken) {
+          state.callToken = state.devToken;
+          var t = $('try-token'); if (t && !t.value) t.value = state.devToken;
+        }
+      })
       .catch(function () { $('dev-login').hidden = true; });
   }
   $('dev-login').addEventListener('click', function () {

@@ -67,6 +67,7 @@
              :x-spindle-scopes (vec (sort scopes))
              :parameters (vec params)
              :responses (responses)}
+      (seq (:examples fl)) (assoc :x-spindle-examples (vec (:examples fl)))
       (seq body-entries)
       (assoc :requestBody {:required true
                            :content {"application/json"
