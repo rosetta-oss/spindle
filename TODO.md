@@ -84,7 +84,57 @@ Where work continues after 2026-11-17. Everything up to `04110f7` was built and 
       Consider `:or-else` on failure as well.
 - [ ] **Single-row not found:** `:on-empty :not_found` → 404 instead of `rows: null`.
 
-## 5. Later
+## 5. Order-desk needs (from a review of real customer requests, 2026-11-19)
+
+A sample of a shared order-desk mailbox's requests was checked against the first graph's flows. Order status is
+covered: finding an order by our number, the customer's PO or the vendor PO; the vendor ETA with its next action;
+cartons, carrier, tracking and proof of delivery; quote lines and the orders a quote became; parts, stock, open POs
+and lead times. Most order-status and lead-time questions can be answered with that.
+
+The new items below are **flows** (flow configuration, kept in the company's own configuration, not in this
+repository). They need no new engine features, so the feature freeze above does not block them. Checking them needs
+real data (see the precondition at the end).
+
+**Flows the requests need, most important first:**
+
+- [ ] **Order holds and line states:** why an order is held (credit, pricing, compliance, stock), and each line's
+      state (allocated, back ordered, non-cancellable). Requests ask why an order is stuck, or whether a released
+      account's held orders can ship now.
+- [ ] **Invoices and serial numbers:** an invoice by its number, its lines, and the serial numbers per carton (by order
+      or carton). Requests dispute quantities on an invoice or ask when it was billed.
+- [ ] **Returns (RMA):** by return request number or by order: status, labels / call tags, receipt, credit memo.
+      Returns must be followed until closed, and today this means looking in another system every day.
+- [ ] **Quotes by the number customers write**, the quote's validity, and deal / bid registrations with their expiry
+      (today only by internal id or by customer).
+- [ ] **Freight on an order or invoice**, and the free-freight rule.
+- [ ] **Warehouse cut-off times** (may be configuration data rather than a query): ship from a warehouse that has not
+      cut off yet.
+- [ ] **Product extras:** replacement for an end-of-life part, warranty / service pack to product fit, country of
+      origin, export classification.
+- [ ] **Who owns an account** (sales rep, desk): the account procedure flow exists but needs the real database.
+- [ ] **Look up by the vendor's own order number.**
+
+**On the graph side** (Semalith, no new flows needed):
+
+- [ ] Link the entities: order line → product / stock / lead time / open PO; part match → product / stock / lead time;
+      order → customer; product → vendor. Then "when does it arrive, is it in stock" is one query instead of 3–4
+      rounds (most of an assistant's 20–56 s per answer).
+- [ ] Saved queries for the common requests: an order in full (state, lines, shipments, ETA, next action) and supply
+      for a part (stock, open POs, lead time).
+- [ ] Extend `next_action` to the new objects: who handles a hold, what a return waits for, who takes an invoice
+      dispute.
+
+**Writes (later):** new orders, changes and cancellations are a large share of the requests. Start with one common,
+reversible write (for example cancelling a back-ordered line, or changing the ship-to address): declared as a
+mutation in the graph, drafted by the assistant and executed only after a person confirms.
+
+- [ ] **Precondition:** the flows run on a test sample today, so an order can be missing and the account procedure
+      cannot run. Checking holds, invoices / serials and returns needs the real database, or a sample that covers the
+      mailbox's last 90 days of orders.
+
+Suggested order: holds and line states, invoices and serial numbers, returns, together with the graph links.
+
+## 6. Later
 
 - [ ] `:search` (Elasticsearch / OpenSearch), design §5.6.
 - [ ] `/catalog/<endpoint-id>?format=semalith` (ready-to-paste operation EDN).
