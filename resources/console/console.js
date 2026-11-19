@@ -278,6 +278,43 @@
     });
     return rows;
   }
+  // The :sql strings of a flow's .edn (EDN string escapes undone).
+  function sqlStrings(edn) {
+    var out = [], re = /:sql\s+"((?:[^"\\]|\\.)*)"/g, m;
+    while ((m = re.exec(edn || ''))) out.push(m[1].replace(/\\(["\\])/g, '$1').replace(/\\n/g, '\n'));
+    return out;
+  }
+  // A light SQL layout for reading only (never executed): a new line before each clause, indented
+  // by parenthesis depth; text inside quotes is left alone.
+  var SQL_BREAK = /^(select|from|where|and|or|union all|union|order by|group by|having|left join|right join|inner join|cross join|join|on|with|limit|case|when|else|end)\b/i;
+  function formatSql(q) {
+    if (/\n/.test(q)) return q; // already laid out by its author
+    var out = '', depth = 0, i = 0, inStr = false, cases = [], clause = [];
+    var pad = function (d) { return new Array(d + 1).join('    '); };
+    var nl = function (d, extra) { out = out.replace(/ +$/, '') + (out ? '\n' : '') + pad(d) + (extra || ''); };
+    while (i < q.length) {
+      var c = q[i];
+      if (inStr) { out += c; if (c === "'") inStr = false; i++; continue; }
+      if (c === "'") { inStr = true; out += c; i++; continue; }
+      if (c === '(') { depth++; out += c; i++; continue; }
+      if (c === ')') { depth = Math.max(0, depth - 1); out += c; i++; continue; }
+      var inCase = cases.length && cases[cases.length - 1] === depth;
+      // one column per line in a select list
+      if (c === ',' && clause[depth] === 'select' && !inCase) { out += ','; nl(depth, '       '); i++; while (q[i] === ' ') i++; continue; }
+      var prev = i === 0 ? ' ' : q[i - 1];
+      if (/[\s(]/.test(prev)) {
+        var m = SQL_BREAK.exec(q.slice(i)), w = m && m[1].toLowerCase();
+        if (w === 'case') cases.push(depth);
+        else if (w === 'end' && inCase) cases.pop();
+        else if (w && !inCase && !/^(on|when|else|end)$/.test(w)) {
+          if (w === 'and' || w === 'or') { if (clause[depth] !== 'select') nl(depth, '  '); }
+          else { nl(depth); clause[depth] = w; }
+        }
+      }
+      out += c; i++;
+    }
+    return out;
+  }
   function endpointDetail(id) {
     var d = (state.epDefs || {})[id] || { loading: true };
     var box = el('div', { class: 'ep-detail' });
@@ -295,8 +332,13 @@
     var pr = paramRows(d.openapi);
     box.appendChild(section('Parameters', pr.length ? table(['Call', 'Name', 'In', 'Required', 'Type', 'Description'], pr)
                                                     : el('p', { class: 'muted', text: 'No parameters.' })));
+    var stmts = sqlStrings(d.edn);
+    stmts.forEach(function (q, i) {
+      box.appendChild(section('SQL' + (stmts.length > 1 ? ' — step ' + (i + 1) : '') + ' (laid out for reading)',
+                              el('pre', { class: 'try-body ep-src', text: formatSql(q) })));
+    });
+    if (d.sql) box.appendChild(section('SQL (' + d.id + '.sql)', el('pre', { class: 'try-body ep-src', text: formatSql(d.sql) })));
     box.appendChild(section('Flow definition (' + d.id + '.edn)', el('pre', { class: 'try-body ep-src', text: d.edn })));
-    if (d.sql) box.appendChild(section('SQL (' + d.id + '.sql)', el('pre', { class: 'try-body ep-src', text: d.sql })));
     return box;
   }
   function cacheRows(kind, obj) {
