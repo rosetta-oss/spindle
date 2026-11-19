@@ -147,3 +147,19 @@
   (is (not (web/secure? {:remote-addr "localhost"})))
   (is (web/secure? {:remote-addr "127.0.0.1"}))
   (is (web/secure? {:remote-addr "[::1]"})))
+
+(deftest flow-definition-for-admins
+  (let [{:keys [store h admin]} (setup)
+        user (:token (tokens/issue! store {:id "u" :scopes ["sales:read"] :created-by "test"}))
+        r (call h :get "/admin/flows/shop/orders" admin)]
+    (is (= 200 (:status r)))
+    (is (= "shop/orders" (get-in r [:json :id])))
+    (is (= "/shop/orders" (get-in r [:json :endpoint :path])))
+    (is (= ["sales:read"] (get-in r [:json :endpoint :scopes])))
+    (is (re-find #":steps" (get-in r [:json :edn])))
+    (is (re-find #"select id, customer" (get-in r [:json :sql])))
+    (is (= ["id"] (map :name (get-in r [:json :openapi :/shop/orders :get :parameters]))))
+    (is (= 404 (:status (call h :get "/admin/flows/shop/nope" admin))))
+    (is (= 404 (:status (call h :get "/admin/flows/../connections" admin))))
+    (is (= 403 (:status (call h :get "/admin/flows/shop/orders" user))))
+    (is (= 403 (:status (call h :get "/admin/flows/shop/orders" admin :remote "10.0.0.9"))) "plain HTTP from elsewhere")))

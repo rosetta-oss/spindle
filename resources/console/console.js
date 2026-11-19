@@ -4,7 +4,7 @@
   var TABS = ['Overview', 'Activity', 'Connections', 'Endpoints', 'Try it', 'Caches', 'Config', 'Tokens'];
   var state = { tab: 'Overview', status: null, tokens: null, showRevoked: false, timer: null,
                 activity: null, window: 'last_5m', expanded: {},
-                openapi: null, tryPath: null, tryValues: {}, callToken: '' };
+                openapi: null, tryPath: null, epOpen: null, epDefs: {}, tryValues: {}, callToken: '' };
   // Activity thresholds: rows above them are flagged
   var MAX_ERROR_RATE = 0.05, MAX_P95_MS = 5000;
 
@@ -50,7 +50,7 @@
   function logout(msg) {
     setToken(null);
     stopPolling();
-    state.status = null; state.tokens = null; state.openapi = null; state.callToken = ''; state.tryValues = {};
+    state.status = null; state.tokens = null; state.openapi = null; state.epOpen = null; state.epDefs = {}; state.callToken = ''; state.tryValues = {};
     $('app').hidden = true;
     $('login').hidden = false;
     $('login-error').textContent = msg || '';
@@ -178,9 +178,89 @@
         return { cells: [c.id, c.type, breakerBadge(c.breaker), bulk(c.bulkhead), poolText(c.pool), errText(c.last_error)] };
       }));
   }
+  // Endpoints: click a path to see its definition (parameters, the flow's .edn with its
+  // comments, the .sql). Definitions are fetched once and kept, so polling does not refetch.
   function endpoints(s) {
-    return table(['Method', 'Path', 'Flow'],
-      (s.endpoints || []).map(function (e) { return { cells: [String(dash(e.method)).toUpperCase(), e.path, e.id] }; }));
+    var wrap = el('div');
+    var ver = (s.config || {}).version;
+    if (state.epDefsVer !== ver) { state.epDefs = {}; state.epDefsVer = ver; fetchDef(state.epOpen); } // a reload changes definitions
+    var eps = (s.endpoints || []).slice().sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0; });
+    wrap.appendChild(table(['Method', 'Path', 'Flow'], eps.map(function (e) {
+      var open = state.epOpen === e.id;
+      return { cls: open ? 'flagged' : null,
+               cells: [String(dash(e.method)).toUpperCase(),
+                       el('button', { class: 'link', text: e.path, title: 'Show the definition',
+                                      onclick: function () { openEndpoint(open ? null : e.id); } }),
+                       e.id] };
+    })));
+    if (state.epOpen) wrap.insertBefore(endpointDetail(state.epOpen), wrap.firstChild);
+    return wrap;
+  }
+  function fetchDef(id) {
+    if (!id || state.epDefs[id]) return;
+    state.epDefs[id] = { loading: true };
+    api('GET', '/admin/flows/' + id.split('/').map(encodeURIComponent).join('/')).then(function (r) {
+      state.epDefs[id] = r.ok ? r.body : { error: errMsg(r) };
+      render();
+    }).catch(function (e) { if (e && e.message !== 'auth') { state.epDefs[id] = { error: e.message }; render(); } });
+  }
+  function openEndpoint(id) {
+    state.epOpen = id;
+    fetchDef(id);
+    render();
+    if (id) window.scrollTo(0, 0);
+  }
+  function schemaText(sc) {
+    if (!sc) return '—';
+    var t = sc.type === 'array' ? (((sc.items || {}).type || 'any') + '[]') : (sc.type || 'any');
+    var lim = [];
+    if (sc.enum) lim.push('one of ' + sc.enum.join(', '));
+    if (sc.minimum != null) lim.push('≥ ' + sc.minimum);
+    if (sc.maximum != null) lim.push('≤ ' + sc.maximum);
+    if (sc.minLength != null || sc.maxLength != null) lim.push('length ' + dash(sc.minLength) + '..' + dash(sc.maxLength));
+    if (sc.minItems != null || sc.maxItems != null) lim.push('items ' + dash(sc.minItems) + '..' + dash(sc.maxItems));
+    if (sc.format) lim.push(sc.format);
+    return t + (lim.length ? ' (' + lim.join('; ') + ')' : '');
+  }
+  function paramRows(oa) {
+    var rows = [];
+    Object.keys(oa || {}).sort().forEach(function (path) {
+      Object.keys(oa[path]).forEach(function (m) {
+        var op = oa[path][m] || {};
+        (op.parameters || []).forEach(function (p) {
+          rows.push({ cells: [m.toUpperCase() + ' ' + path, p.name, p.in, p.required ? 'yes' : 'no', schemaText(p.schema), p.description] });
+        });
+        var body = (((op.requestBody || {}).content || {})['application/json'] || {}).schema;
+        if (body && body.properties) {
+          Object.keys(body.properties).forEach(function (k) {
+            rows.push({ cells: [m.toUpperCase() + ' ' + path, k, 'body', (body.required || []).indexOf(k) >= 0 ? 'yes' : 'no',
+                                schemaText(body.properties[k]), body.properties[k].description] });
+          });
+        }
+      });
+    });
+    return rows;
+  }
+  function endpointDetail(id) {
+    var d = (state.epDefs || {})[id] || { loading: true };
+    var box = el('div', { class: 'ep-detail' });
+    box.appendChild(el('div', { class: 'ep-head' }, [
+      el('h2', { text: d.endpoint ? d.endpoint.method.toUpperCase() + ' ' + d.endpoint.path : id }),
+      el('button', { text: 'Close', onclick: function () { openEndpoint(null); } })]));
+    if (d.loading) { box.appendChild(el('p', { class: 'muted', text: 'Loading…' })); return box; }
+    if (d.error) { box.appendChild(el('p', { class: 'error', text: 'Could not load the definition: ' + d.error })); return box; }
+    var ep = d.endpoint || {};
+    box.appendChild(table(['Item', 'Value'], [
+      { cells: ['Flow', d.id] }, { cells: ['Version', d.version] },
+      { cells: ['Scopes', (ep.scopes || []).join(', ') || 'none'] },
+      { cells: ['Batch form', ep.batch ? 'POST /api/_batch/' + ep.id : 'no'] },
+      { cells: ['Paging', ep.page ? 'yes (size, after)' : 'no'] }]));
+    var pr = paramRows(d.openapi);
+    box.appendChild(section('Parameters', pr.length ? table(['Call', 'Name', 'In', 'Required', 'Type', 'Description'], pr)
+                                                    : el('p', { class: 'muted', text: 'No parameters.' })));
+    box.appendChild(section('Flow definition (' + d.id + '.edn)', el('pre', { class: 'try-body ep-src', text: d.edn })));
+    if (d.sql) box.appendChild(section('SQL (' + d.id + '.sql)', el('pre', { class: 'try-body ep-src', text: d.sql })));
+    return box;
   }
   function cacheRows(kind, obj) {
     return Object.keys(obj || {}).map(function (k) {

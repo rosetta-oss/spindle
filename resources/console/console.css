@@ -44,3 +44,7 @@ tr.detail td { color:var(--muted); font-size:12px; }
 .try-curl { display:block; padding:.4rem .6rem; background:var(--card); border:1px solid var(--line); margin:.4rem 0; word-break:break-all; font-size:12px; }
 .try-body { background:var(--card); border:1px solid var(--line); padding:.6rem; max-height:60vh; overflow:auto; font-size:12px; }
 @media (max-width: 600px) { .try-form label { grid-template-columns:1fr; } .try-form .muted { margin-left:0; } }
+/* endpoint definitions */
+.ep-detail { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.5rem 1rem; margin-bottom:1rem; }
+.ep-head { display:flex; justify-content:space-between; align-items:center; gap:1rem; }
+.ep-src { white-space:pre-wrap; word-break:break-word; max-height:50vh; }

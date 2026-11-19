@@ -316,6 +316,26 @@
 (def ^:private console-types
   {"html" "text/html; charset=utf-8" "js" "text/javascript; charset=utf-8" "css" "text/css; charset=utf-8"})
 
+(defn- flow-definition
+  "GET /admin/flows/<id>: what the console shows for one endpoint — the flow's .edn
+   (with its comments) and .sql text, the endpoint, and its OpenAPI operations."
+  [snap id]
+  (let [ep (some #(when (= id (:id %)) %) (:endpoints snap))
+        fid (or (:flow ep) id)
+        edn (when (mcp/valid-flow-id? fid) (get (:tree snap) (str "flows/" fid ".edn")))]
+    (if-not edn
+      (json-resp 404 {:error {:code "not_found" :message "no such flow"}})
+      (let [paths (:paths (openapi/document snap))
+            mine #{(:path ep) (str batch-prefix (:id ep))}]
+        (json-resp 200 {:id fid
+                        :version (get-in snap [:flows fid :version])
+                        :endpoint (when ep {:id (:id ep) :method (name (:method ep)) :path (:path ep)
+                                            :scopes (vec (sort (:scopes ep)))
+                                            :batch (some? (:batch ep)) :page (some? (:page ep))})
+                        :openapi (into {} (filter (fn [[p _]] (contains? mine (name p)))) paths)
+                        :edn edn
+                        :sql (get (:tree snap) (str "flows/" fid ".sql"))})))))
+
 (defn- console-resp [uri]
   (let [rel (-> uri (subs (count "/console")) (str/replace #"^/" ""))
         rel (if (str/blank? rel) "index.html" rel)
@@ -382,7 +402,7 @@
           (or (= uri "/console") (str/starts-with? uri "/console/"))
           (if (web/secure? req) (console-resp uri) (web/insecure-resp))
 
-          (and (or (tokens-uri? uri) (= uri "/admin/activity")) (not (web/secure? req))) (web/insecure-resp)
+          (and (or (tokens-uri? uri) (= uri "/admin/activity") (str/starts-with? uri "/admin/flows/")) (not (web/secure? req))) (web/insecure-resp)
 
           (or (= uri "/mcp") (str/starts-with? uri "/mcp/"))
           (if (web/secure? req)
@@ -393,7 +413,10 @@
           (let [caller (auth/authenticate (:auth snap) store req)]
             (if-not (auth/allowed? caller #{(get-in snap [:auth :admin-scope] "spindle:admin")})
               (json-resp 403 {:error {:code "forbidden" :message "admin scope required"}})
-              (case (if (tokens-uri? uri) :tokens [(:request-method req) uri])
+              (case (cond (tokens-uri? uri) :tokens
+                          (and (= :get (:request-method req)) (str/starts-with? uri "/admin/flows/")) :flow
+                          :else [(:request-method req) uri])
+                :flow (flow-definition snap (subs uri (count "/admin/flows/")))
                 :tokens (if store (token-admin snap store caller req) (json-resp 404 {:error {:code "not_found"}}))
                 [:post "/admin/reload"] (let [r (config/with-write-lock (config/reload! config-dir))] (register-gauges!) (json-resp (if (:ok r) 200 422) r))
                 [:post "/admin/config/rollback"]
