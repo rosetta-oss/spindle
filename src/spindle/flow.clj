@@ -505,7 +505,12 @@
         ctx (if-let [tx (when (#{:sql :proc} (:kind step)) (:tx env))]
               (assoc ctx :con #(tx/connection! tx (:conn step)) :on-broken #(tx/mark-broken! tx (:conn step)))
               ctx)
-        rows (run-step-kind* snapshot flow-id step env ctx rt)]
+        rows (run-step-kind* snapshot flow-id step env ctx rt)
+        rows (if-let [k (:keep-if step)]
+               (let [res {:spindle.output/params (:params env)}
+                     ok? #(spindle.output/keep-row? k res %)]
+                 (cond (sequential? rows) (vec (filter ok? rows)) (map? rows) (when (ok? rows) rows) :else rows))
+               rows)]
     (when (:write? step)
       (when-let [a (:affected env)] (swap! a assoc (:id step) (affected-of rows))))
     (if (:write? step) (check-expect! step rows) rows)))
@@ -591,7 +596,7 @@
         zone (some (fn [[_ s]] (get-in snapshot [:conns (:conn s) :cfg :zone])) (:steps flow))
         ;; shaping runs SCI expressions: bound by the remaining deadline
         remaining-ms (max 1 (quot (- deadline-ns (System/nanoTime)) 1000000))
-        fut (future (output/shape-with-checks (:output flow) results zone))
+        fut (future (output/shape-with-checks (:output flow) (assoc results :spindle.output/params params) zone))
         {:keys [rows checks]}
         (try (.get ^java.util.concurrent.Future fut remaining-ms TimeUnit/MILLISECONDS)
              (catch TimeoutException _

@@ -133,6 +133,8 @@
    [:fan-out {:optional true} Path]
    [:fan-where {:optional true} [:map-of keyword? any?]]
    [:fan-key {:optional true} keyword?]
+   ;; drop rows whose columns do not match a request parameter (comma list; empty = keep all), before later steps use them
+   [:keep-if {:optional true} [:map {:closed true} [:param keyword?] [:any-of [:vector {:min 1} keyword?]]]]
    [:concurrency {:optional true} pos-int?]
    [:or-else {:optional true} keyword?]
    [:after {:optional true} [:vector keyword?]]
@@ -172,6 +174,10 @@
                        [:nest {:optional true} [:map-of keyword? [:ref ::output]]]
                        [:compute {:optional true} [:map-of keyword? any?]]
                        [:derive {:optional true} [:or [:map-of keyword? any?] [:vector [:tuple keyword? any?]]]]
+                       ;; keep only rows whose columns match a request parameter (comma list; empty = all)
+                       [:keep-if {:optional true} [:map {:closed true}
+                                                   [:param keyword?]
+                                                   [:any-of [:vector {:min 1} keyword?]]]]
                        [:assert {:optional true} [:vector vector?]]
                        [:on-fail {:optional true} [:enum :flag :error]]
                        [:types {:optional true} [:map-of keyword? keyword?]]

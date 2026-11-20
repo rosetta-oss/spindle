@@ -69,6 +69,20 @@
 
 (declare shape-rows)
 
+(defn- param-values
+  "A parameter as a set of trimmed strings: comma list, number, or list. nil when empty (no filter)."
+  [v]
+  (let [xs (cond (nil? v) []
+                 (sequential? v) (map str v)
+                 :else (clojure.string/split (str v) #","))
+        xs (into #{} (comp (map clojure.string/trim) (remove clojure.string/blank?)) xs)]
+    (when (seq xs) xs)))
+
+(defn keep-row? [{:keys [param any-of]} results row]
+  (if-let [want (param-values (get-in results [::params param]))]
+    (boolean (some (fn [c] (let [v (get row c)] (and (some? v) (contains? want (clojure.string/trim (str v)))))) any-of))
+    true))
+
 (defn- apply-spec [row spec results zone]
   (let [row (if-let [{:keys [from on select pick]} (:merge spec)]
               (let [idx (index-by (get results from) on)
@@ -79,8 +93,9 @@
                                         {:spindle/code :internal})))
                     m (first ms)]
                 (merge row (if select (select-keys m select) (apply dissoc m (vals on)))))
-              row)
-        row (reduce (fn [r [k {:keys [from on one?] :as sub}]]
+              row)]
+    (when (or (nil? (:keep-if spec)) (keep-row? (:keep-if spec) results row))
+     (let [row (reduce (fn [r [k {:keys [from on one?] :as sub}]]
                       (let [kids (get (index-by (get results from) on) (left-key r on))
                             kids (shape-rows kids sub results zone)]
                         (assoc r k (if one? (first kids) (vec kids)))))
@@ -96,10 +111,10 @@
         row (if-let [rn (:rename spec)] (clojure.set/rename-keys row rn) row)
         ;; a :hidden nest feeds :compute / :derive but is not returned (e.g. raw lists with cost fields)
         row (reduce (fn [r [k sub]] (if (:hidden sub) (dissoc r k) r)) row (:nest spec))]
-    row))
+    row))))
 
 (defn shape-rows [rows spec results zone]
-  (mapv #(apply-spec % spec results zone) rows))
+  (into [] (keep #(apply-spec % spec results zone)) rows))
 
 (defn shape-with-checks
   "→ {:rows vector-or-one-row :checks [{:row i :assert a :result :fail|:unknown}]}."

@@ -161,3 +161,12 @@
         res {:a [{:id 1}] :b [{:id 1 :cost 9} {:id 1 :cost 8}]}]
     (is (= [{:id 1 :n 2}] (output/shape-rows (:a res) spec res nil))
         "a :hidden nest is visible to :compute but not returned")))
+
+(deftest keep-if-filter
+  (let [spec (output/compile-spec {:from :a :keep-if {:param :cust_no :any-of [:m :b]}})
+        rows [{:id 1 :m 10 :b 20} {:id 2 :m 11 :b 21} {:id 3 :m nil :b 30}]
+        res (fn [c] {:a rows :spindle.output/params {:cust_no c}})]
+    (is (= [1] (map :id (output/shape spec (res "20") nil))) "matches any listed column")
+    (is (= [1 3] (map :id (output/shape spec (res " 10 , 30") nil))) "comma list, spaces trimmed")
+    (is (= [] (output/shape spec (res "99") nil)) "no match: nothing returned")
+    (is (= [1 2 3] (map :id (output/shape spec (res "") nil))) "empty param: no filter")))
