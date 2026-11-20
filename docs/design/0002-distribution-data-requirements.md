@@ -1,6 +1,6 @@
 # 0002 — Data requirements for a distributor's order desk
 
-Status: draft (2026-11-19). Purpose: the data a test environment should hold, and the business knowledge to write down, so that Spindle flows and a semantic graph on top of them can answer what customers ask an IT distributor's order desk by email.
+Status: draft (2026-11-19; revision 2 2026-11-20: requirements from two desk procedures, §Procedures). Purpose: the data a test environment should hold, and the business knowledge to write down, so that Spindle flows and a semantic graph on top of them can answer what customers ask an IT distributor's order desk by email.
 
 The questions come from a sample of real order-desk mail, grouped into ten business areas. No mail, customer, part number or system name from that sample is reproduced here.
 
@@ -73,6 +73,51 @@ Each area lists the data to prepare, the sample cases (at least two of each), an
 - **Samples:** cancellable back-ordered line; drop-ship line with the vendor PO already sent; picked order that can no longer change; order whose address can still change.
 - **Knowledge:** the cut-off stage for each kind of change; vendor confirmation for drop-ship cancellations; non-cancellable rules; what a customer must supply for a change (company, full address, contact, phone).
 
+## Procedures: what two desk procedures need (2026-11-20)
+
+The desk standardises its work per business type: each type is a fixed procedure, and an assistant only does narrow, checked steps inside it (read the request, write a draft) while every system lookup is a fixed query. Two procedures are written so far. What they need beyond the inventory below:
+
+### Order status (area A)
+
+Steps: read the numbers → look up orders → apply the ETA rules → hand lines without a valid ETA to the ETA follow-up team → draft the reply → a person sends it → follow up.
+
+| Need | Lookup | Fields | Status |
+| --- | --- | --- | --- |
+| Customer PO → sales orders | customer PO, as written (several spellings), customer | sales order / back order numbers, type, date, status | in inventory |
+| Lines, shipments, tracking | sales order | SKU, ordered / shipped / back-ordered qty, cartons, carrier, tracking | in inventory |
+| ETA per line | order line / vendor PO line | ETA, status code, source, revisions | in inventory |
+| Open vendor PO lines per SKU | SKU + warehouse | all open PO lines, qty, vendor-portal ship date as given | in inventory |
+| Deleted orders / lines | order or PO number | deleted flag, when, by whom | **new** |
+| Software licence delivery | sales order | licence status, how it is delivered | **new** |
+
+ETA rules the procedure applies (to be confirmed per company; they decide which fields matter): a valid ETA is a scheduled/shipped status with a date after today; a shipped status on a vendor PO means shipped to the distributor, not to the customer; partial receipt → ETA only for the open quantity; a vendor ship date not after today is past due and goes to the follow-up team; lead time is never a firm ETA.
+
+### Order cancellation (area J)
+
+Steps: read what to cancel → acknowledge → find the vendor PO line for each SKU → decide per line (cancellable / return instead) → find the vendor's purchasing contact → draft the cancellation request (no reseller data in it) → wait for the vendor → internal cancellation (vendor PO removed, sales order re-queued) → reply with the result.
+
+| Need | Lookup | Fields | Status |
+| --- | --- | --- | --- |
+| Customer PO → sales order → vendor PO lines | customer PO + SKU | sales order, vendor PO, vendor, line, qty, status | in inventory |
+| Shipment state per vendor PO line | vendor PO line | shipped qty, ship date, tracking | in inventory |
+| **Purchasing contact per vendor** | vendor (or SKU) | primary buyer name and email, backup, team mailbox | **new** |
+| **Vendor invoice state per vendor PO line** (payables side) | vendor PO + line | invoiced yes/no, vendor invoice number, date | **new** |
+| **Vendor PO removal and sales order re-queue** | vendor PO, sales order | removed flag, when, by whom; re-queued flag, when | **new** |
+| Cancellation rules | vendor, product class | when a line can still be cancelled, when it must be returned instead, vendor-specific steps | **new** (knowledge article) |
+
+### Sub-line pegging (areas A, G, J)
+
+One customer PO line is often split: part shipped from stock, the rest back-ordered, the back order covered by one or more vendor PO lines arriving in parts. Today ETA, shipment and tracking sit on whole lines, so "when do the remaining 221 units arrive?" has no exact answer. Needed: a **sub-line** record per split quantity, linked end to end:
+
+customer PO line (qty) → sales order / back order sub-line (qty) → vendor PO line (qty) → its own ETA, receipt, shipment, tracking
+
+| Entity | Key fields | Linked to |
+| --- | --- | --- |
+| Order sub-line | order, line, sub-line no, qty, status, ETA, ship date, carton / tracking | order line, vendor PO line |
+| Pegging | customer PO line, order sub-line, vendor PO line, pegged qty, since | all three |
+
+Until source systems keep sub-lines, the flows should return line-level data and say when a line is split, so answers never give one ETA for the whole line.
+
 ## Full data inventory
 
 30 entities. Prepare them together so numbers chain: customer → quote → customer PO → sales order → vendor PO → shipment → invoice → RMA → credit.
@@ -134,4 +179,9 @@ Each area lists the data to prepare, the sample cases (at least two of each), an
 | 11 | G | "Order 260 of part X today — when do they arrive?" | SKU from the vendor part, available per warehouse, incoming, lead time in one query |
 | 12 | H | "Part X is end of life — replacement? new warranty?" | replacement SKU, valid warranties, rule for open orders |
 
-Pass: answers match the test data, cite the documented rules, and questions 1, 2 and 11 take one graph query.
+| 13 | A | "Line 1 of PO X: 38 shipped, the rest?" | each split quantity with its own status, ETA or tracking (sub-lines) |
+| 14 | J | "Please cancel all of PO X." | every vendor PO line behind it, cancellable or not and why, the vendor's purchasing contact |
+| 15 | J | "Has the vendor invoiced line 2?" | vendor invoice state for that vendor PO line |
+| 16 | J | "Is the cancellation finished?" | vendor confirmation, vendor PO removed, sales order re-queued, with times |
+
+Pass: answers match the test data, cite the documented rules, and questions 1, 2, 11 and 13 take one graph query.
