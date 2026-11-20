@@ -75,7 +75,12 @@
                            [{::httpstep/fan 10 ::httpstep/body {:items [{:v 1} {:v 2}]}}
                             {::httpstep/fan 20 ::httpstep/body {:items [{:v 3}]}}
                             {::httpstep/fan 30 ::httpstep/body nil}]))
-      ":fan-key tags each row with the value it was fetched for"))
+      ":fan-key tags each row with the value it was fetched for")
+  (is (= [1 3] (#'httpstep/fan-values {:fan-out [:s :id] :fan-where {:t ["A" "C"]}}
+                                       {:results {:s [{:id 1 :t "A"} {:id 2 :t "B"} {:id 3 :t "C"}]}})))
+  (is (= [2] (#'httpstep/fan-values {:fan-out [:s :id] :fan-where {:no [:want :no]}}
+                                     {:results {:s [{:id 1 :no "x1"} {:id 2 :no "x"}] :want [{:no "x"}]}}))
+      "a :fan-where value can be a data path"))
 
 (deftest request-templates
   (let [env {:params {:n [7 8] :t 1}}]
@@ -150,3 +155,9 @@
     (is (= {:before (spindle.sql/typed-null java.sql.Types/INTEGER) :name nil :n 3}
            (#'spindle.flow/type-nulls {:before nil :name nil :n 3} {:before java.sql.Types/INTEGER})))))
 
+(deftest hidden-nest
+  (let [spec (output/compile-spec {:from :a :nest {:raw {:from :b :on {:id :id} :hidden true}}
+                                   :compute {:n '(count raw)}})
+        res {:a [{:id 1}] :b [{:id 1 :cost 9} {:id 1 :cost 8}]}]
+    (is (= [{:id 1 :n 2}] (output/shape-rows (:a res) spec res nil))
+        "a :hidden nest is visible to :compute but not returned")))

@@ -163,6 +163,7 @@
                        [:from {:optional true} keyword?]
                        [:on {:optional true} [:map-of keyword? keyword?]]
                        [:one? {:optional true} boolean?]
+                       [:hidden {:optional true} boolean?]
                        [:merge {:optional true} [:map {:closed true}
                                                  [:from keyword?]
                                                  [:on [:map-of keyword? keyword?]]

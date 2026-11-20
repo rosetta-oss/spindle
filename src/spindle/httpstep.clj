@@ -117,12 +117,17 @@
 
 (defn- fan-values
   "Values to fan out over. With :fan-where {col v | [v ...]} only rows of the
-   source step whose columns match give a value (e.g. only rows of one type)."
+   source step whose columns match give a value (e.g. only rows of one type).
+   A :fan-where value is a literal, a list of literals, or a data path."
   [{:keys [fan-out fan-where]} env]
   (if-not fan-where
     (paths/as-list (paths/resolve-path fan-out env))
     (let [[s & more] fan-out
-          match? (fn [r] (every? (fn [[k v]] (let [x (get r k)] (if (vector? v) (some #(= x %) v) (= x v)))) fan-where))]
+          ;; a value may be a literal, a list of literals, or a data path whose values are allowed
+          allowed (into {} (map (fn [[k v]] [k (if (paths/path? v) (set (paths/as-list (paths/resolve-path v env)))
+                                                    (if (vector? v) (set v) #{v}))]))
+                        fan-where)
+          match? (fn [r] (every? (fn [[k vs]] (contains? vs (get r k))) allowed))]
       (->> (get-in env [:results s]) paths/as-list (filter match?)
            (map #(get-in % more)) (remove nil?) distinct vec))))
 
@@ -137,7 +142,11 @@
       ;; one call per value, up to :concurrency at once (default 4); the
       ;; connection's bulkhead still bounds calls across all requests
       (par/bounded-map (or (:concurrency step) 4)
-                       (fn [v] (let [b (conn/guarded rt #(call-once! rt step (assoc env :fan v) ctx))]
+                       (fn [v] (let [b (if (:optional step)
+                                         ;; an :optional fan-out step loses only the calls that fail
+                                         (try (conn/guarded rt #(call-once! rt step (assoc env :fan v) ctx))
+                                              (catch clojure.lang.ExceptionInfo _ nil))
+                                         (conn/guarded rt #(call-once! rt step (assoc env :fan v) ctx)))]
                                  (if (:fan-key step) {::fan v ::body b} b)))
                        vs))
     [(conn/guarded rt #(call-once! rt step env ctx))]))

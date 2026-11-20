@@ -93,7 +93,9 @@
                                          {:assert a :result r})))
               row)
         row (if-let [s (:select spec)] (select-keys row (concat s (keys (:nest spec)) [::checks])) row)
-        row (if-let [rn (:rename spec)] (clojure.set/rename-keys row rn) row)]
+        row (if-let [rn (:rename spec)] (clojure.set/rename-keys row rn) row)
+        ;; a :hidden nest feeds :compute / :derive but is not returned (e.g. raw lists with cost fields)
+        row (reduce (fn [r [k sub]] (if (:hidden sub) (dissoc r k) r)) row (:nest spec))]
     row))
 
 (defn shape-rows [rows spec results zone]
