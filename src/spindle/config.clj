@@ -120,6 +120,10 @@
    [:body {:optional true} [:or [:map-of keyword? any?] [:vector any?]]]
    [:headers {:optional true} [:map-of [:or string? keyword?] any?]]])
 
+(def KeepIf
+  (let [one [:map {:closed true} [:param keyword?] [:any-of [:vector {:min 1} keyword?]]]]
+    [:or one [:vector {:min 1} one]]))
+
 (def Step
   [:map {:closed true}
    [:id keyword?]
@@ -133,8 +137,9 @@
    [:fan-out {:optional true} Path]
    [:fan-where {:optional true} [:map-of keyword? any?]]
    [:fan-key {:optional true} keyword?]
-   ;; drop rows whose columns do not match a request parameter (comma list; empty = keep all), before later steps use them
-   [:keep-if {:optional true} [:map {:closed true} [:param keyword?] [:any-of [:vector {:min 1} keyword?]]]]
+   ;; drop rows whose columns do not match a request parameter (comma list; empty = keep all), before later steps use them;
+   ;; a vector of checks must all pass
+   [:keep-if {:optional true} KeepIf]
    [:concurrency {:optional true} pos-int?]
    [:or-else {:optional true} keyword?]
    [:after {:optional true} [:vector keyword?]]
@@ -175,9 +180,7 @@
                        [:compute {:optional true} [:map-of keyword? any?]]
                        [:derive {:optional true} [:or [:map-of keyword? any?] [:vector [:tuple keyword? any?]]]]
                        ;; keep only rows whose columns match a request parameter (comma list; empty = all)
-                       [:keep-if {:optional true} [:map {:closed true}
-                                                   [:param keyword?]
-                                                   [:any-of [:vector {:min 1} keyword?]]]]
+                       [:keep-if {:optional true} KeepIf]
                        [:assert {:optional true} [:vector vector?]]
                        [:on-fail {:optional true} [:enum :flag :error]]
                        [:types {:optional true} [:map-of keyword? keyword?]]

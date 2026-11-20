@@ -170,3 +170,23 @@
     (is (= [1 3] (map :id (output/shape spec (res " 10 , 30") nil))) "comma list, spaces trimmed")
     (is (= [] (output/shape spec (res "99") nil)) "no match: nothing returned")
     (is (= [1 2 3] (map :id (output/shape spec (res "") nil))) "empty param: no filter")))
+
+(deftest keep-if-several-checks
+  (let [spec (output/compile-spec {:from :a :keep-if [{:param :cust_no :any-of [:m]} {:param :terr :any-of [:t]}]})
+        rows [{:id 1 :m 10 :t 18001} {:id 2 :m 10 :t 4404} {:id 3 :m 11 :t 18001}]
+        res (fn [c t] {:a rows :spindle.output/params {:cust_no c :terr t}})]
+    (is (= [1] (map :id (output/shape spec (res "10" "18001") nil))) "every check must pass")
+    (is (= [1 3] (map :id (output/shape spec (res "" "18001") nil))) "an empty parameter does not filter")
+    (is (= [1 2] (map :id (output/shape spec (res "10" nil) nil))))))
+
+(deftest params-one-of
+  (let [schema (malli.core/schema [:map {:spindle/one-of [:a :b]}
+                                   [:a {:optional true :default ""} :string] [:b {:optional true :default ""} :string]])]
+    (is (= "x" (:a (spindle.flow/coerce-params schema {:a "x"}))))
+    (is (= "y" (:b (spindle.flow/coerce-params schema {:b "y"}))))
+    (is (thrown? clojure.lang.ExceptionInfo (spindle.flow/coerce-params schema {})) "neither given")
+    (is (thrown? clojure.lang.ExceptionInfo (spindle.flow/coerce-params schema {:a " "})) "blank counts as missing")))
+
+(deftest fan-where-path-is-a-dependency
+  (is (= #{:hdr :terr} (#'spindle.flow/step-deps {:fan-out [:hdr :orderNo] :fan-where {:cpoId [:terr :cpoId] :type ["SO" "BO"]}}))
+      "a data path in :fan-where makes the step wait for that step; a literal list does not"))

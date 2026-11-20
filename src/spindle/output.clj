@@ -78,10 +78,17 @@
         xs (into #{} (comp (map clojure.string/trim) (remove clojure.string/blank?)) xs)]
     (when (seq xs) xs)))
 
-(defn keep-row? [{:keys [param any-of]} results row]
+(declare keep-row?)
+
+(defn- keep-one? [{:keys [param any-of]} results row]
   (if-let [want (param-values (get-in results [::params param]))]
     (boolean (some (fn [c] (let [v (get row c)] (and (some? v) (contains? want (clojure.string/trim (str v)))))) any-of))
     true))
+
+(defn keep-row?
+  "One check {:param :any-of} or a vector of checks (all must pass)."
+  [k results row]
+  (if (map? k) (keep-one? k results row) (every? #(keep-one? % results row) k)))
 
 (defn- apply-spec [row spec results zone]
   (let [row (if-let [{:keys [from on select pick]} (:merge spec)]

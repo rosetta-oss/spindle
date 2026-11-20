@@ -87,11 +87,13 @@
     (:not c) (not (eval-cond (:not c) env))
     :else false))
 
-(defn- step-deps [{:keys [in request or-else fan-out when after]}]
+(defn- step-deps [{:keys [in request or-else fan-out fan-where when after]}]
   (set (concat after                       ; explicit order (e.g. a read-back after a write)
                (mapcat path-steps (vals in))
                (mapcat path-steps (request-paths request))
                (path-steps fan-out)
+               ;; a :fan-where value that is a data path waits for its step
+               (mapcat path-steps (filter (fn [v] (and (vector? v) (keyword? (first v)))) (vals fan-where)))
                (mapcat path-steps (cond-paths when)))))
 
 (defn- uses-caller? [{:keys [in request when]} conn-cfg]
@@ -393,7 +395,11 @@
   (let [raw (split-lists schema raw)
         v (m/decode schema raw (mt/transformer (mt/default-value-transformer {::mt/add-optional-keys true}) mt/string-transformer mt/strip-extra-keys-transformer))]
     (if (m/validate schema v)
-      v
+      ;; [:map {:spindle/one-of [:a :b]} ...]: at least one of these parameters must be given (non-blank)
+      (let [ks (when (= :map (m/type schema)) (:spindle/one-of (m/properties schema)))]
+        (if (and (seq ks) (not-any? (fn [k] (let [x (get v k)] (if (string? x) (not (str/blank? x)) (if (sequential? x) (seq x) (some? x))))) ks))
+          (err/fail! :input_rejected (str "invalid parameters: give at least one of " (str/join ", " (map name ks))))
+          v))
       (err/fail! :input_rejected (str "invalid parameters: "
                                       (pr-str (malli.error/humanize (m/explain schema v))))))))
 
