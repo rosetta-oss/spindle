@@ -117,7 +117,7 @@
    [:path string?]
    [:path-params {:optional true} [:map-of keyword? any?]]
    [:query {:optional true} [:map-of [:or string? keyword?] any?]]
-   [:body {:optional true} [:map-of keyword? any?]]
+   [:body {:optional true} [:or [:map-of keyword? any?] [:vector any?]]]
    [:headers {:optional true} [:map-of [:or string? keyword?] any?]]])
 
 (def Step
@@ -131,6 +131,8 @@
    [:request {:optional true} Request]
    [:rows {:optional true} string?]
    [:fan-out {:optional true} Path]
+   [:fan-where {:optional true} [:map-of keyword? any?]]
+   [:fan-key {:optional true} keyword?]
    [:concurrency {:optional true} pos-int?]
    [:or-else {:optional true} keyword?]
    [:after {:optional true} [:vector keyword?]]

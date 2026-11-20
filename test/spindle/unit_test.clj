@@ -65,7 +65,24 @@
 
 (deftest json-path-subset
   (is (= [{:a 1}] (httpstep/json-rows [{:a 1}] "$[*]")))
-  (is (= [1 2] (httpstep/json-rows {:x {:items [{:v 1} {:v 2}]}} "$.x.items[*].v"))))
+  (is (= [1 2] (httpstep/json-rows {:x {:items [{:v 1} {:v 2}]}} "$.x.items[*].v")))
+  (is (= [{:o 1} {:o 2} {:o 3}]
+         (httpstep/json-rows {:data {:111 [{:o 1} {:o 2}] :222 [{:o 3}]}} "$.data.@vals[*]")))
+  (is (= [{:a 1}] (httpstep/json-rows {:data [{:a 1}]} "$.data.@vals[*]"))
+      "@vals on a non-map passes it through")
+  (is (= [{:v 1 :id 10} {:v 2 :id 10} {:v 3 :id 20}]
+         (httpstep/extract {:rows "$.items[*]" :fan-key :id}
+                           [{::httpstep/fan 10 ::httpstep/body {:items [{:v 1} {:v 2}]}}
+                            {::httpstep/fan 20 ::httpstep/body {:items [{:v 3}]}}
+                            {::httpstep/fan 30 ::httpstep/body nil}]))
+      ":fan-key tags each row with the value it was fetched for"))
+
+(deftest request-templates
+  (let [env {:params {:n [7 8] :t 1}}]
+    (is (= {:orderNos [7 8] :orderTypes [1] :includeDeleted true :caller "app"}
+           (paths/resolve-template {:orderNos [:params :n] :orderTypes [[:params :t]] :includeDeleted true :caller "app"} env)))
+    (is (= [{:orderNo [7 8] :orderType 8}] (paths/resolve-template [{:orderNo [:params :n] :orderType 8}] env)))
+    (is (= [[:params :n] [:params :t]] (paths/template-paths {:a [:params :n] :b [{:c [:params :t] :d 1}] :e "x"})))))
 
 ;; ---------------------------------------------------------------------------
 ;; executor

@@ -39,7 +39,8 @@
 (defn- path-steps [p] (when-let [s (paths/step-ref p)] #{s}))
 
 (defn- request-paths [request]
-  (concat (vals (:query request)) (vals (:path-params request)) (vals (:body request))
+  (concat (paths/template-paths (vec (vals (:query request)))) (vals (:path-params request))
+          (paths/template-paths (:body request))
           (filter vector? (vals (:headers request)))))
 
 ;; ---------------------------------------------------------------------------
@@ -267,8 +268,8 @@
                      (do (when (and ccfg (not= :http (:type ccfg)))
                            (add! [:steps id :conn] "an :http step needs an :http connection"))
                          (when-let [rp (:rows s)]
-                           (when-not (re-matches #"\$(\.[A-Za-z_][A-Za-z0-9_-]*|\[\*\])*" rp)
-                             (add! [:steps id :rows] (str "unsupported JSON path " rp "; use $, $.a.b, $[*], $.a[*].b"))))
+                           (when-not (re-matches #"\$(\.[A-Za-z_][A-Za-z0-9_-]*|\.@vals|\[\*\])*" rp)
+                             (add! [:steps id :rows] (str "unsupported JSON path " rp "; use $, $.a.b, $[*], $.a[*].b, $.a.@vals[*]"))))
                          (when (and (:concurrency s) (not (:fan-out s)))
                            (add! [:steps id :concurrency] ":concurrency is for :fan-out steps"))
                          (let [w? (contains? #{:put :patch :delete} (get-in s [:request :method]))]
@@ -419,7 +420,7 @@
 (defn- resolve-request [request env]
   (let [rv (fn [m] (into (sorted-map) (map (fn [[k p]] [k (if (vector? p) (paths/resolve-path p env) p)])) m))]
     (-> request
-        (update :query rv) (update :path-params rv) (update :body #(when % (rv %))) (update :headers rv))))
+        (update :query rv) (update :path-params rv) (update :body #(when % (paths/resolve-template % env))) (update :headers rv))))
 
 (defn- note!
   "Add facts to this step's trace entry (when the request is traced)."

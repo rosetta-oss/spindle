@@ -54,3 +54,27 @@
 
 (defn as-list [v]
   (cond (nil? v) [] (sequential? v) (vec v) :else [v]))
+
+(defn path?
+  "A data path is a vector whose first element is a keyword ([:params :id]);
+   any other value in a request template is a literal."
+  [x] (and (vector? x) (keyword? (first x))))
+
+(defn resolve-template
+  "Resolve an HTTP request template: data paths become their values, maps and
+   vectors are walked, anything else is a literal. E.g.
+   {:orderNos [:params :order_no] :includeDeleted true :orderTypes [1]} or
+   [{:orderNo [:params :order_no] :orderType 8}] for a JSON array body."
+  [t env]
+  (cond (path? t) (resolve-path t env)
+        (map? t) (into {} (map (fn [[k v]] [k (resolve-template v env)])) t)
+        (vector? t) (mapv #(resolve-template % env) t)
+        :else t))
+
+(defn template-paths
+  "Every data path inside a request template."
+  [t]
+  (cond (path? t) [t]
+        (map? t) (mapcat template-paths (vals t))
+        (vector? t) (mapcat template-paths t)
+        :else []))

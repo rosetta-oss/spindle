@@ -1,7 +1,8 @@
 (ns spindle.httpstep
   "Executing an :http step against an :http connection.
 
-   Request values are data paths (never string templates):
+   Request values are data paths (never string templates) or literals; a body
+   may nest maps and arrays, and may itself be an array:
      {:method :get :path \"/inventory/{id}\" :path-params {:id [:params :id]}
       :query {\"product_id\" [:lines :productid]} :body {\"ids\" [:params :ids]}}
    A list in :query is encoded with the connection's :list-style
@@ -34,7 +35,9 @@
     (when (some? v) [[k v]])))
 
 (defn json-rows
-  "Tiny JSON-path subset: $ | $[*] | $.a.b | $.a[*] | $.a[*].b"
+  "Tiny JSON-path subset: $ | $[*] | $.a.b | $.a[*] | $.a[*].b, plus `@vals`:
+   the values of an object whose keys are data (e.g. {\"<id>\": [...]}):
+   $.data.@vals[*]"
   [data path]
   (let [p (or path "$")
         segs (->> (str/split (str/replace (subs p 1) #"\[\*\]" ".*") #"\.")
@@ -43,6 +46,7 @@
               (cond
                 (nil? s) (if (sequential? x) x (when (some? x) [x]))
                 (= s "*") (mapcat #(walk* % more) (if (sequential? x) x [x]))
+                (= s "@vals") (walk* (if (map? x) (vec (vals x)) x) more)
                 :else (walk* (get x (keyword s)) more)))]
       (vec (walk* data segs)))))
 
@@ -53,14 +57,13 @@
                           (str/replace p (str "{" (name k) "}") (enc value))))
                       path path-params)
         qs (->> query
-                (mapcat (fn [[k pth]] (query-pairs (name k) (paths/resolve-path pth env) (:list-style cfg))))
+                (mapcat (fn [[k pth]] (query-pairs (name k) (paths/resolve-template pth env) (:list-style cfg))))
                 (map (fn [[k v]] (str (enc k) "=" (if (and (string? v) (str/starts-with? v "in.(")) v (enc v)))))
                 (str/join "&"))
         url (str (str/replace (:base-url cfg) #"/$" "") path* (when (seq qs) (str "?" qs)))
         remaining-ms (max 1 (quot (- deadline-ns (System/nanoTime)) 1000000))
         timeout-ms (min remaining-ms (conn/parse-duration-ms (get-in cfg [:defaults :timeout]) 5000))
-        body-str (when body (json/write-value-as-string
-                             (into {} (map (fn [[k pth]] [k (paths/resolve-path pth env)])) body)))
+        body-str (when body (json/write-value-as-string (paths/resolve-template body env)))
         b (-> (HttpRequest/newBuilder (java.net.URI. url))
               (.timeout (Duration/ofMillis timeout-ms))
               (.header "Accept" "application/json")
@@ -112,23 +115,42 @@
                      "upstream call failed" {:step (:id step) :conn (:id rt)} c)))
       (finally (sql/deregister-cancel! cancels k)))))
 
+(defn- fan-values
+  "Values to fan out over. With :fan-where {col v | [v ...]} only rows of the
+   source step whose columns match give a value (e.g. only rows of one type)."
+  [{:keys [fan-out fan-where]} env]
+  (if-not fan-where
+    (paths/as-list (paths/resolve-path fan-out env))
+    (let [[s & more] fan-out
+          match? (fn [r] (every? (fn [[k v]] (let [x (get r k)] (if (vector? v) (some #(= x %) v) (= x v)))) fan-where))]
+      (->> (get-in env [:results s]) paths/as-list (filter match?)
+           (map #(get-in % more)) (remove nil?) distinct vec))))
+
 (defn fetch!
   "Call the upstream; → vector of parsed response bodies (one per call; fan-out
    makes several). Bodies, not rows, are what the step cache stores, so several
-   steps/endpoints projecting different parts of one response share one call."
+   steps/endpoints projecting different parts of one response share one call.
+   With :fan-key each body is kept with its fan value ({::fan v ::body b})."
   [rt step env ctx]
-  (if-let [fan-path (:fan-out step)]
-    (let [vs (paths/as-list (paths/resolve-path fan-path env))]
+  (if (:fan-out step)
+    (let [vs (fan-values step env)]
       ;; one call per value, up to :concurrency at once (default 4); the
       ;; connection's bulkhead still bounds calls across all requests
       (par/bounded-map (or (:concurrency step) 4)
-                       (fn [v] (conn/guarded rt #(call-once! rt step (assoc env :fan v) ctx)))
+                       (fn [v] (let [b (conn/guarded rt #(call-once! rt step (assoc env :fan v) ctx))]
+                                 (if (:fan-key step) {::fan v ::body b} b)))
                        vs))
     [(conn/guarded rt #(call-once! rt step env ctx))]))
 
 (defn extract
-  "Apply the step's :rows JSON path to each body and concatenate."
+  "Apply the step's :rows JSON path to each body and concatenate. With
+   :fan-key, every row gets the fan value it was fetched for under that key."
   [step bodies]
-  (vec (mapcat #(if (nil? %) [] (json-rows % (:rows step))) bodies)))
+  (let [k (:fan-key step)]
+    (vec (mapcat (fn [b]
+                   (if k
+                     (map #(if (map? %) (assoc % k (::fan b)) %) (when (some? (::body b)) (json-rows (::body b) (:rows step))))
+                     (if (nil? b) [] (json-rows b (:rows step)))))
+                 bodies))))
 
 (defn run-step! [rt step env ctx] (extract step (fetch! rt step env ctx)))

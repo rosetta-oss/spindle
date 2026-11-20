@@ -22,8 +22,13 @@
 
 (defn parse-date [s] (when s (java.time.LocalDate/parse (str s))))
 
+(defn today
+  "Today's date as yyyy-MM-dd (server zone); compare with (subs ts 0 10)."
+  [] (str (java.time.LocalDate/now)))
+
 (def helpers
   {'round-half-up round-half-up
+   'today today
    'parse-date parse-date
    'blank? str/blank?})
 
@@ -34,7 +39,7 @@
     str subs format keyword name
     get get-in assoc dissoc select-keys keys vals contains? count first second last rest next nth
     seq empty? not-empty vec vector list hash-map set conj into concat distinct
-    map mapv filter filterv remove reduce sort sort-by group-by frequencies partition-by
+    map mapv mapcat filter filterv remove reduce sort sort-by group-by frequencies partition-by
     some every? take drop take-while drop-while
     double long int bigdec boolean
     identity constantly comp partial juxt
