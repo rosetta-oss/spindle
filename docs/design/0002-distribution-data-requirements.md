@@ -136,7 +136,7 @@ An email gives a number without its type, so L1 runs once per type; a customer P
 What one run on test data showed — each is a requirement for the flows or for the test data:
 
 1. **To-one links come back as one-element lists** (customer, product, vendor, ship method, warehouse). Callers that expect a single object show blanks. Flows should either return a single object for a to-one link or document the list shape.
-2. **One customer PO number, two customers.** `NNNNNN` (a different customer, three months earlier) and `PO-NNNNNN` (the customer asking) both matched. When the conversation's own order numbers fix the customer, results for other customers must be dropped; L2 / L3 should accept a customer filter.
+2. **One customer PO number, two customers.** `239110` (a different customer, three months earlier) and `PO-239110` (the customer asking) both matched. When the conversation's own order numbers fix the customer, results for other customers must be dropped; L2 / L3 should accept a customer filter.
 3. **Drop-ship order without ship or invoice date.** The order is closed and its line shows 1 shipped, yet ship date and invoice date are empty, so "not invoiced" is reported. The test data (and the flow) must say where a drop-ship shipment and its invoice are recorded.
 4. **A vendor PO number given as the customer's PO.** The number was looked up as a customer PO and not found; it was the vendor PO behind the sales order. L2 / L3 finding nothing for an all-digit number should fall back to L1 with type PO.
 
