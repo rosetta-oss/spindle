@@ -1,6 +1,6 @@
 # 0002 — Data requirements for a distributor's order desk
 
-Status: draft (2026-11-19; revision 2 2026-11-20: requirements from two desk procedures, §Procedures). Purpose: the data a test environment should hold, and the business knowledge to write down, so that Spindle flows and a semantic graph on top of them can answer what customers ask an IT distributor's order desk by email.
+Status: draft (2026-11-19; revision 2 2026-11-20: requirements from two desk procedures, §Procedures; revision 3 2026-11-20: reference lookups and a test run, §Reference lookups). Purpose: the data a test environment should hold, and the business knowledge to write down, so that Spindle flows and a semantic graph on top of them can answer what customers ask an IT distributor's order desk by email.
 
 The questions come from a sample of real order-desk mail, grouped into ten business areas. No mail, customer, part number or system name from that sample is reproduced here.
 
@@ -117,6 +117,28 @@ customer PO line (qty) → sales order / back order sub-line (qty) → vendor PO
 | Pegging | customer PO line, order sub-line, vendor PO line, pegged qty, since | all three |
 
 Until source systems keep sub-lines, the flows should return line-level data and say when a line is split, so answers never give one ETA for the whole line.
+
+## Reference lookups and what a test run found (2026-11-20)
+
+The fixed lookups a desk tool runs today for "order details", "is it fulfilled?" and "stock and incoming for a part". Every one is read-only and should be a Spindle flow (or one graph query) with exactly these inputs.
+
+| # | Lookup | Input | Returns |
+| --- | --- | --- | --- |
+| L1 | Order by number | number, type (sales order, back order, PO) | header (type, kind, status, dates, deleted, customer PO, ship-to, total), customer, ship method, lines (SKU, part, ordered / shipped / received qty, status, price), cartons (tracking, ship date, POD), vendor POs behind it (vendor, status, lines, ETA codes and dates with `updated_at`) |
+| L2 | Customer PO by number | PO as written | customer PO (status, date, total, end-user PO), customer, its orders as in L1 |
+| L3 | Sales orders carrying a customer PO | PO as written | orders as in L1 (fallback when L2 finds nothing) |
+| L4 | Product search | part number, symbols removed, upper case | SKU, vendor part, lifecycle status |
+| L5 | Product supply | SKU | vendor and vendor lead time, stock per warehouse (available, on order, back-ordered), product lead time, open vendor PO lines with qty and ETA |
+| K1 | Knowledge: vendor PO line next action | — | when to answer the customer and when to ask the vendor first |
+
+An email gives a number without its type, so L1 runs once per type; a customer PO is tried in three spellings (as written, digits only, `PO-<digits>`) in L2 and L3. A typical conversation costs 10–15 lookups; on test data they take 0.3 s together.
+
+What one run on test data showed — each is a requirement for the flows or for the test data:
+
+1. **To-one links come back as one-element lists** (customer, product, vendor, ship method, warehouse). Callers that expect a single object show blanks. Flows should either return a single object for a to-one link or document the list shape.
+2. **One customer PO number, two customers.** `NNNNNN` (a different customer, three months earlier) and `PO-NNNNNN` (the customer asking) both matched. When the conversation's own order numbers fix the customer, results for other customers must be dropped; L2 / L3 should accept a customer filter.
+3. **Drop-ship order without ship or invoice date.** The order is closed and its line shows 1 shipped, yet ship date and invoice date are empty, so "not invoiced" is reported. The test data (and the flow) must say where a drop-ship shipment and its invoice are recorded.
+4. **A vendor PO number given as the customer's PO.** The number was looked up as a customer PO and not found; it was the vendor PO behind the sales order. L2 / L3 finding nothing for an all-digit number should fall back to L1 with type PO.
 
 ## Full data inventory
 
